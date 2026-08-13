@@ -50,11 +50,10 @@ object VideoProcessor {
                     callback.onSuccess(outputPath)
                 } else {
                     val fullLog = session.allLogsAsString ?: ""
-                    val logTail = if (fullLog.length > 3500) {
-                        fullLog.takeLast(3500)
-                    } else {
-                        fullLog
-                    }
+                    val logTail = fullLog
+                        .lines()
+                        .takeLast(20)
+                        .joinToString("\n")
 
                     callback.onError(
                         "FFmpeg code: ${session.returnCode}\n\n$logTail"
