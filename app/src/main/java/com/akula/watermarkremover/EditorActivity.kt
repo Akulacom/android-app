@@ -1312,6 +1312,8 @@ class EditorActivity : AppCompatActivity() {
                 outputPath = outputPath,
                 keyframes = keyframes,
                 durationMs = videoDurationMs,
+                videoWidth = videoWidth,
+                videoHeight = videoHeight,
                 callback = object : VideoProcessor.Callback {
                     override fun onProgress(percent: Int) {
                         runOnUiThread {

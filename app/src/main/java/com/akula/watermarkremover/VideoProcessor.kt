@@ -1,5 +1,6 @@
 package com.akula.watermarkremover
 
+import android.graphics.RectF
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegSession
 import com.arthenica.ffmpegkit.ReturnCode
@@ -27,10 +28,49 @@ object VideoProcessor {
         outputPath: String,
         keyframes: List<MaskKeyframe>,
         durationMs: Long,
+        videoWidth: Int,
+        videoHeight: Int,
         callback: Callback
     ) {
-        val delogoChain = MaskTracker.buildTrackedDelogoFilter(keyframes, durationMs)
-        val filter = "$delogoChain,scale=-2:1080"
+        if (videoWidth < 2 || videoHeight < 2) {
+            callback.onError("Некорректный размер видео: ${videoWidth}x${videoHeight}")
+            return
+        }
+
+        val frameWidth = videoWidth.toFloat()
+        val frameHeight = videoHeight.toFloat()
+
+        val safeKeyframes = keyframes.map { keyframe ->
+            if (!keyframe.active) {
+                keyframe
+            } else {
+                val left = keyframe.rect.left.coerceIn(0f, frameWidth)
+                val top = keyframe.rect.top.coerceIn(0f, frameHeight)
+                val right = keyframe.rect.right.coerceIn(0f, frameWidth)
+                val bottom = keyframe.rect.bottom.coerceIn(0f, frameHeight)
+                val clipped = RectF(left, top, right, bottom)
+
+                if (clipped.width() < 2f || clipped.height() < 2f) {
+                    keyframe.copy(
+                        rect = RectF(0f, 0f, 0f, 0f),
+                        active = false,
+                        confidence = 0f
+                    )
+                } else {
+                    keyframe.copy(
+                        rect = RectF(
+                            clipped.left + 1f,
+                            clipped.top + 1f,
+                            clipped.right + 1f,
+                            clipped.bottom + 1f
+                        )
+                    )
+                }
+            }
+        }
+
+        val delogoChain = MaskTracker.buildTrackedDelogoFilter(safeKeyframes, durationMs)
+        val filter = "pad=iw+2:ih+2:1:1,$delogoChain,crop=iw-2:ih-2:1:1,scale=-2:1080"
 
         val cmd = arrayOf(
             "-y",
