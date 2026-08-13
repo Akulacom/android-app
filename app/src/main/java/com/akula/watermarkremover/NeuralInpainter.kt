@@ -115,10 +115,14 @@ object NeuralInpainter {
                 (index.toLong() * videoDurationMs) / (totalFrames - 1)
             } else 0L
 
-            val maskRect = MaskTracker.interpolate(sortedKeyframes, timeMs)
+            val maskRects = MaskTracker.activeRectsAtTime(sortedKeyframes, timeMs)
             val srcBitmap = BitmapFactory.decodeFile(frameFile.absolutePath)
 
-            val resultBitmap = inpaintFrame(ortEnv, session, srcBitmap, maskRect)
+            val resultBitmap = if (maskRects.isEmpty()) {
+                srcBitmap.copy(srcBitmap.config ?: Bitmap.Config.ARGB_8888, false)
+            } else {
+                inpaintFrame(ortEnv, session, srcBitmap, maskRects)
+            }
             File(outFramesDir, frameFile.name).outputStream().use { out ->
                 resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
             }
@@ -164,7 +168,7 @@ object NeuralInpainter {
         env: OrtEnvironment,
         session: OrtSession,
         srcBitmap: Bitmap,
-        maskRect: android.graphics.RectF
+        maskRects: List<android.graphics.RectF>
     ): Bitmap {
         val origW = srcBitmap.width
         val origH = srcBitmap.height
@@ -178,11 +182,13 @@ object NeuralInpainter {
         val paint = Paint().apply { color = Color.WHITE; isAntiAlias = true }
         val scaleX = MODEL_INPUT_SIZE / origW.toFloat()
         val scaleY = MODEL_INPUT_SIZE / origH.toFloat()
-        canvas.drawRect(
-            maskRect.left * scaleX, maskRect.top * scaleY,
-            maskRect.right * scaleX, maskRect.bottom * scaleY,
-            paint
-        )
+        for (maskRect in maskRects) {
+            canvas.drawRect(
+                maskRect.left * scaleX, maskRect.top * scaleY,
+                maskRect.right * scaleX, maskRect.bottom * scaleY,
+                paint
+            )
+        }
 
         val imageTensor = bitmapToTensor(env, resized)
         val maskTensor = maskToTensor(env, maskBitmap)

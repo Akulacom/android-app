@@ -37,6 +37,7 @@ class EditorActivity : AppCompatActivity() {
     private var videoDurationMs = 0L
 
     private val keyframes = mutableListOf<MaskKeyframe>()
+    private var keyframesGenerated = false
     private val uiHandler = Handler(Looper.getMainLooper())
     private var trackingSeekBar = false
 
@@ -99,6 +100,7 @@ class EditorActivity : AppCompatActivity() {
         binding.btnAddKeyframe.setOnClickListener { onAddKeyframe() }
         binding.btnClearKeyframes.setOnClickListener {
             keyframes.clear()
+            keyframesGenerated = false
             binding.maskOverlay.maskRect.setEmpty()
             binding.maskOverlay.invalidate()
             updateKeyframeLabel()
@@ -594,18 +596,15 @@ class EditorActivity : AppCompatActivity() {
 
     private fun isLikelyOverlayRect(rect: android.graphics.Rect, frameW: Int, frameH: Int): Boolean {
         if (rect.width() < 8 || rect.height() < 6) return false
-        if (rect.width() > frameW * 0.55f || rect.height() > frameH * 0.25f) return false
+        if (rect.width() > frameW * 0.75f || rect.height() > frameH * 0.38f) return false
 
         val areaRatio = (rect.width().toFloat() * rect.height().toFloat()) /
             (frameW.toFloat() * frameH.toFloat())
-        if (areaRatio > 0.08f) return false
 
-        val cx = rect.exactCenterX() / frameW.toFloat()
-        val cy = rect.exactCenterY() / frameH.toFloat()
-
-        // Watermark обычно держится ближе к краям. Боковые зоны разрешаем
-        // по всей высоте, чтобы ловить Dola AI слева посередине.
-        return cx <= 0.38f || cx >= 0.62f || cy <= 0.22f || cy >= 0.78f
+        // Не привязываемся к углам: watermark может лежать по центру,
+        // поверх лица или в любой другой части кадра. Фильтруем только
+        // слишком крупные области, которые почти наверняка являются сценой.
+        return areaRatio in 0.00008f..0.12f
     }
 
     private fun paddedVideoRect(source: android.graphics.Rect, frameW: Int, frameH: Int): RectF {
@@ -641,9 +640,9 @@ class EditorActivity : AppCompatActivity() {
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         try {
             val stepMs = when {
-                videoDurationMs <= 20_000L -> 350L
-                videoDurationMs <= 60_000L -> 500L
-                else -> 750L
+                videoDurationMs <= 20_000L -> 300L
+                videoDurationMs <= 60_000L -> 450L
+                else -> 650L
             }
 
             val sampleTimes = mutableListOf<Long>()
@@ -665,14 +664,18 @@ class EditorActivity : AppCompatActivity() {
                     MediaMetadataRetriever.OPTION_CLOSEST
                 ) ?: continue
 
-                val ocrFrame = if (frame.width < 900) {
-                    val scale = 1.6f
-                    Bitmap.createScaledBitmap(
-                        frame,
-                        (frame.width * scale).toInt(),
-                        (frame.height * scale).toInt(),
-                        true
-                    )
+                val targetWidth = when {
+                    frame.width < 720 -> (frame.width * 1.5f).toInt()
+                    frame.width > 1080 -> 1080
+                    else -> frame.width
+                }
+                val targetHeight = maxOf(
+                    1,
+                    (frame.height * targetWidth.toFloat() / frame.width.toFloat()).toInt()
+                )
+
+                val ocrFrame = if (targetWidth != frame.width) {
+                    Bitmap.createScaledBitmap(frame, targetWidth, targetHeight, true)
                 } else {
                     frame
                 }
@@ -685,7 +688,7 @@ class EditorActivity : AppCompatActivity() {
                     for (line in block.lines) {
                         val box = line.boundingBox ?: continue
                         val key = normalizeWatermarkText(line.text)
-                        if (key.length < 2 || key.length > 40) continue
+                        if (key.length < 2 || key.length > 48) continue
                         if (!isLikelyOverlayRect(box, ocrFrame.width, ocrFrame.height)) continue
 
                         val candidate = OcrCandidate(
@@ -713,84 +716,164 @@ class EditorActivity : AppCompatActivity() {
                 val percent = (((index + 1).toFloat() / sampleTimes.size.toFloat()) * 100f)
                     .toInt().coerceIn(0, 100)
                 runOnUiThread {
-                    binding.tvStatus.text = "Поиск watermark: $percent%"
+                    binding.tvStatus.text = "Поиск текстовых watermark: $percent%"
                 }
             }
 
-            val validGroups = groups
-                .filter { it.items.size >= 2 }
-                .sortedByDescending { it.items.size }
+            data class RankedGroup(
+                val group: OcrGroup,
+                val score: Float,
+                val medianW: Float,
+                val medianH: Float
+            )
 
-            if (validGroups.isEmpty()) {
-                throw IllegalStateException(
-                    "Повторяющийся текстовый watermark не найден"
-                )
+            val ranked = groups.mapNotNull { group ->
+                val byTime = group.items.groupBy { it.timeMs }
+                val unique = byTime.values.mapNotNull { list -> list.minByOrNull { it.rect.width() * it.rect.height() } }
+                if (unique.size < 2) return@mapNotNull null
+
+                val widths = unique.map { it.rect.width() }.sorted()
+                val heights = unique.map { it.rect.height() }.sorted()
+                val areas = unique.map { it.rect.width() * it.rect.height() }.sorted()
+                val medianW = widths[widths.size / 2]
+                val medianH = heights[heights.size / 2]
+                val minArea = areas.first().coerceAtLeast(1f)
+                val maxArea = areas.last().coerceAtLeast(minArea)
+                val sizeRatio = maxArea / minArea
+                if (sizeRatio > 4.5f) return@mapNotNull null
+
+                val bins = mutableMapOf<String, Int>()
+                var edgeCount = 0
+                for (item in unique) {
+                    val nx = (item.rect.centerX() / videoWidth.toFloat()).coerceIn(0f, 0.999f)
+                    val ny = (item.rect.centerY() / videoHeight.toFloat()).coerceIn(0f, 0.999f)
+                    val bx = (nx * 5f).toInt().coerceIn(0, 4)
+                    val by = (ny * 7f).toInt().coerceIn(0, 6)
+                    val bin = "$bx:$by"
+                    bins[bin] = (bins[bin] ?: 0) + 1
+                    if (nx < 0.20f || nx > 0.80f || ny < 0.16f || ny > 0.84f) {
+                        edgeCount++
+                    }
+                }
+
+                val anchorConcentration = (bins.values.maxOrNull() ?: 0).toFloat() / unique.size.toFloat()
+                val edgeFraction = edgeCount.toFloat() / unique.size.toFloat()
+                val spanMs = unique.maxOf { it.timeMs } - unique.minOf { it.timeMs }
+                val positionCompactness = if (bins.size <= 4) 1f else 0f
+                val sizeConsistency = (1f / sizeRatio.coerceAtLeast(1f)).coerceIn(0f, 1f)
+
+                var score = unique.size * 1.7f
+                score += anchorConcentration * 3.0f
+                score += edgeFraction * 2.2f
+                score += positionCompactness * 1.8f
+                score += sizeConsistency * 1.2f
+                if (spanMs >= stepMs * 2) score += 1.0f
+                if (group.key.length in 3..20) score += 0.7f
+
+                val strongEnough = unique.size >= 3 ||
+                    edgeFraction >= 0.60f ||
+                    anchorConcentration >= 0.66f
+
+                if (!strongEnough || score < 6.0f) return@mapNotNull null
+                RankedGroup(group, score, medianW, medianH)
+            }.sortedByDescending { it.score }
+
+            if (ranked.isEmpty()) {
+                throw IllegalStateException("Повторяющийся текстовый watermark не найден")
             }
 
-            // Берём все устойчивые повторяющиеся подписи, но не более трёх.
-            // Это позволяет одному ролику иметь разные watermark в разных сценах.
-            val accepted = validGroups.take(3)
+            // До 6 независимых watermark-треков. В отличие от старой версии
+            // мы НЕ выбираем одну надпись на кадр: несколько треков могут быть
+            // активны одновременно и независимо исчезать/появляться.
+            val accepted = ranked.take(6)
+            val allFrames = mutableListOf<MaskKeyframe>()
+            val diagonal = kotlin.math.hypot(videoWidth.toFloat(), videoHeight.toFloat())
 
-            fun groupRank(candidate: OcrCandidate): Int {
-                val index = accepted.indexOfFirst { sameWatermarkKey(it.key, candidate.key) }
-                return if (index < 0) Int.MAX_VALUE else index
-            }
+            for ((trackId, rankedGroup) in accepted.withIndex()) {
+                val trackFrames = mutableListOf<MaskKeyframe>()
 
-            val resultFrames = mutableListOf<MaskKeyframe>()
-            for (timeMs in sampleTimes) {
-                val choices = candidatesByTime[timeMs]
-                    .orEmpty()
-                    .filter { groupRank(it) != Int.MAX_VALUE }
-                    .sortedWith(
-                        compareBy<OcrCandidate> { groupRank(it) }
-                            .thenBy { it.rect.width() * it.rect.height() }
+                for (timeMs in sampleTimes) {
+                    val choices = candidatesByTime[timeMs]
+                        .orEmpty()
+                        .filter { sameWatermarkKey(rankedGroup.group.key, it.key) }
+
+                    val chosen = choices.minByOrNull { candidate ->
+                        val dw = kotlin.math.abs(candidate.rect.width() - rankedGroup.medianW) /
+                            rankedGroup.medianW.coerceAtLeast(1f)
+                        val dh = kotlin.math.abs(candidate.rect.height() - rankedGroup.medianH) /
+                            rankedGroup.medianH.coerceAtLeast(1f)
+                        dw + dh
+                    }
+
+                    if (chosen == null) {
+                        trackFrames.add(
+                            MaskKeyframe(
+                                timeMs = timeMs,
+                                rect = RectF(),
+                                active = false,
+                                trackId = trackId,
+                                confidence = 0f
+                            )
+                        )
+                    } else {
+                        val geometryError =
+                            kotlin.math.abs(chosen.rect.width() - rankedGroup.medianW) /
+                                rankedGroup.medianW.coerceAtLeast(1f) +
+                            kotlin.math.abs(chosen.rect.height() - rankedGroup.medianH) /
+                                rankedGroup.medianH.coerceAtLeast(1f)
+                        val confidence = (1f - geometryError * 0.35f).coerceIn(0.35f, 1f)
+                        trackFrames.add(
+                            MaskKeyframe(
+                                timeMs = timeMs,
+                                rect = chosen.rect,
+                                active = true,
+                                trackId = trackId,
+                                confidence = confidence
+                            )
+                        )
+                    }
+                }
+
+                // Закрываем только одиночный пропуск OCR. Если позиции до/после
+                // сильно отличаются, считаем это скачком/склейкой и не рисуем
+                // маску между ними.
+                for (i in 1 until trackFrames.size - 1) {
+                    val current = trackFrames[i]
+                    if (current.active) continue
+                    val prev = trackFrames[i - 1]
+                    val next = trackFrames[i + 1]
+                    if (!prev.active || !next.active) continue
+
+                    val distance = kotlin.math.hypot(
+                        next.rect.centerX() - prev.rect.centerX(),
+                        next.rect.centerY() - prev.rect.centerY()
                     )
 
-                val chosen = choices.firstOrNull()
-                if (chosen == null) {
-                    resultFrames.add(MaskKeyframe(timeMs, RectF(), active = false))
-                } else {
-                    resultFrames.add(MaskKeyframe(timeMs, chosen.rect, active = true))
+                    if (distance <= diagonal * 0.10f) {
+                        trackFrames[i] = MaskKeyframe(
+                            timeMs = current.timeMs,
+                            rect = RectF(
+                                (prev.rect.left + next.rect.left) / 2f,
+                                (prev.rect.top + next.rect.top) / 2f,
+                                (prev.rect.right + next.rect.right) / 2f,
+                                (prev.rect.bottom + next.rect.bottom) / 2f
+                            ),
+                            active = true,
+                            trackId = trackId,
+                            confidence = minOf(prev.confidence, next.confidence) * 0.8f
+                        )
+                    }
                 }
+
+                allFrames.addAll(trackFrames)
             }
 
-            // Закрываем единичные OCR-пропуски между двумя близкими позициями.
-            // Длинные промежутки остаются inactive — там watermark не трогаем.
-            for (i in 1 until resultFrames.size - 1) {
-                val current = resultFrames[i]
-                if (current.active) continue
-
-                val prev = resultFrames[i - 1]
-                val next = resultFrames[i + 1]
-                if (!prev.active || !next.active) continue
-
-                val prevCx = prev.rect.centerX()
-                val prevCy = prev.rect.centerY()
-                val nextCx = next.rect.centerX()
-                val nextCy = next.rect.centerY()
-                val distance = kotlin.math.hypot(nextCx - prevCx, nextCy - prevCy)
-                val diagonal = kotlin.math.hypot(videoWidth.toFloat(), videoHeight.toFloat())
-
-                if (distance <= diagonal * 0.12f) {
-                    resultFrames[i] = MaskKeyframe(
-                        current.timeMs,
-                        RectF(
-                            (prev.rect.left + next.rect.left) / 2f,
-                            (prev.rect.top + next.rect.top) / 2f,
-                            (prev.rect.right + next.rect.right) / 2f,
-                            (prev.rect.bottom + next.rect.bottom) / 2f
-                        ),
-                        active = true
-                    )
-                }
-            }
-
-            val activeCount = resultFrames.count { it.active }
+            val activeCount = allFrames.count { it.active }
             if (activeCount < 2) {
                 throw IllegalStateException("Watermark найден слишком неуверенно")
             }
 
-            return resultFrames
+            return allFrames
         } finally {
             recognizer.close()
         }
@@ -914,11 +997,12 @@ class EditorActivity : AppCompatActivity() {
             throw IllegalStateException("Не удалось создать шаблон watermark")
         }
 
-        val tracked = mutableListOf<MaskKeyframe>()
+        data class RawMatch(val timeMs: Long, val rect: RectF, val score: Float)
+        val raw = mutableListOf<RawMatch>()
         val stepMs = when {
-            videoDurationMs <= 15_000L -> 400L
-            videoDurationMs <= 30_000L -> 600L
-            else -> 1000L
+            videoDurationMs <= 20_000L -> 300L
+            videoDurationMs <= 60_000L -> 450L
+            else -> 700L
         }
 
         var timeMs = 0L
@@ -927,29 +1011,81 @@ class EditorActivity : AppCompatActivity() {
             if (frame != null) {
                 val result = findWatermarkOnFrame(frame, template)
                 val found = result.first
+                val padX = maxOf(2f, found.width() * 0.08f)
+                val padY = maxOf(2f, found.height() * 0.12f)
                 val rect = RectF(
-                    found.left.toFloat() / frame.width.toFloat() * videoWidth.toFloat(),
-                    found.top.toFloat() / frame.height.toFloat() * videoHeight.toFloat(),
-                    found.right.toFloat() / frame.width.toFloat() * videoWidth.toFloat(),
-                    found.bottom.toFloat() / frame.height.toFloat() * videoHeight.toFloat()
+                    ((found.left - padX) / frame.width.toFloat() * videoWidth.toFloat()).coerceAtLeast(0f),
+                    ((found.top - padY) / frame.height.toFloat() * videoHeight.toFloat()).coerceAtLeast(0f),
+                    ((found.right + padX) / frame.width.toFloat() * videoWidth.toFloat()).coerceAtMost(videoWidth.toFloat()),
+                    ((found.bottom + padY) / frame.height.toFloat() * videoHeight.toFloat()).coerceAtMost(videoHeight.toFloat())
                 )
-                tracked.add(MaskKeyframe(timeMs, rect))
+                raw.add(RawMatch(timeMs, rect, result.second))
+                frame.recycle()
             }
 
-            val percent = (timeMs.toFloat() / videoDurationMs.toFloat() * 100f).toInt().coerceIn(0, 100)
+            val percent = (timeMs.toFloat() / videoDurationMs.toFloat() * 100f)
+                .toInt().coerceIn(0, 100)
             runOnUiThread {
-                binding.tvStatus.text = "Автотрекинг: $percent%"
+                binding.tvStatus.text = "Проверка выделенного watermark: $percent%"
             }
-
             timeMs += stepMs
         }
 
-        if (tracked.isEmpty()) {
-            throw IllegalStateException("Watermark не найден")
+        referenceFrame.recycle()
+        templateBitmap.recycle()
+
+        if (raw.isEmpty()) throw IllegalStateException("Watermark не найден")
+
+        // Старый код всегда выбирал 'лучшее из плохого' и поэтому стирал
+        // случайные области даже когда логотипа уже не было. Теперь вводим
+        // динамический порог: плохие совпадения становятся active=false.
+        val scores = raw.map { it.score }.sorted()
+        val lowIndex = ((scores.size - 1) * 0.20f).toInt().coerceIn(0, scores.lastIndex)
+        val lowScore = scores[lowIndex]
+        val threshold = (lowScore * 1.75f + 6f).coerceIn(16f, 52f)
+
+        val tracked = raw.map { item ->
+            val active = item.score <= threshold
+            val confidence = if (active) {
+                (1f - item.score / threshold.coerceAtLeast(1f)).coerceIn(0.25f, 1f)
+            } else 0f
+            MaskKeyframe(
+                timeMs = item.timeMs,
+                rect = if (active) item.rect else RectF(),
+                active = active,
+                trackId = 0,
+                confidence = confidence
+            )
+        }.toMutableList()
+
+        // Референс пользователя — гарантированно положительный пример.
+        val nearestRef = tracked.indices.minByOrNull { idx ->
+            kotlin.math.abs(tracked[idx].timeMs - referenceTime)
+        }
+        if (nearestRef != null) {
+            tracked[nearestRef] = MaskKeyframe(
+                tracked[nearestRef].timeMs,
+                RectF(sourceRect),
+                active = true,
+                trackId = 0,
+                confidence = 1f
+            )
+        }
+
+        if (tracked.none { it.active }) {
+            throw IllegalStateException("Не удалось уверенно отследить watermark")
         }
 
         if (tracked.last().timeMs < videoDurationMs) {
-            tracked.add(MaskKeyframe(videoDurationMs, RectF(tracked.last().rect)))
+            tracked.add(
+                MaskKeyframe(
+                    videoDurationMs,
+                    RectF(),
+                    active = false,
+                    trackId = 0,
+                    confidence = 0f
+                )
+            )
         }
 
         return tracked
@@ -993,6 +1129,7 @@ class EditorActivity : AppCompatActivity() {
                 runOnUiThread {
                     keyframes.clear()
                     keyframes.addAll(tracked)
+                    keyframesGenerated = true
                     updateKeyframeLabel()
                     binding.progressBar.isIndeterminate = false
 
@@ -1041,29 +1178,41 @@ class EditorActivity : AppCompatActivity() {
         val timeMs = binding.videoView.currentPosition.toLong()
         keyframes.removeAll { kotlin.math.abs(it.timeMs - timeMs) < 50 }
         keyframes.add(MaskKeyframe(timeMs, rect))
+        keyframesGenerated = false
         updateKeyframeLabel()
         Toast.makeText(this, "Точка добавлена на ${timeMs / 1000}с", Toast.LENGTH_SHORT).show()
     }
 
     private fun updateKeyframeLabel() {
         val active = keyframes.count { it.active }
+        val tracks = keyframes.filter { it.active }.map { it.trackId }.distinct().size
         binding.tvKeyframes.text = when {
-            keyframes.isEmpty() -> "Точек трекинга: 0"
-            keyframes.size == 1 -> "Точек трекинга: 1 (маска статична)"
-            else -> "Точек трекинга: $active активных / ${keyframes.size} проверок"
+            keyframes.isEmpty() -> "Watermark: ещё не найден"
+            tracks <= 1 -> "Watermark: $active активных проверок"
+            else -> "Найдено watermark-треков: $tracks · активных масок: $active"
         }
     }
 
     private fun onApplyClicked() {
-        if (keyframes.isNotEmpty()) {
+        // Если точки уже созданы автоматическим анализом — сразу обрабатываем.
+        if (keyframes.isNotEmpty() && keyframesGenerated) {
             startProcessingWithCurrentKeyframes()
+            return
+        }
+
+        // Ручные точки теперь используются как СЕМЯ для настоящего трекинга,
+        // а не как приказ стирать область на всём ролике. Это исправляет случай,
+        // когда пользователь отметил три появления, а delogo удалял только одно
+        // и размазывал неверные места между ними.
+        if (keyframes.isNotEmpty()) {
+            val seed = keyframes.first()
+            startAutoTracking(RectF(seed.rect), autoProcessAfter = true)
             return
         }
 
         val manualRect = currentMaskInVideoCoords()
         if (manualRect != null) {
-            keyframes.add(MaskKeyframe(binding.videoView.currentPosition.toLong(), manualRect))
-            startProcessingWithCurrentKeyframes()
+            startAutoTracking(manualRect, autoProcessAfter = true)
             return
         }
 
