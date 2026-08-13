@@ -71,13 +71,13 @@ object MaskTracker {
     fun buildTrackedDelogoFilter(
         keyframes: List<MaskKeyframe>,
         durationMs: Long,
-        maxSegments: Int = 240
+        maxSegments: Int = 360
     ): String {
         require(keyframes.isNotEmpty()) { "Нужен хотя бы один keyframe" }
 
         val tracks = keyframes.groupBy { it.trackId }
         val totalMs = durationMs.coerceAtLeast(1L)
-        val desiredStepMs = 200L
+        val desiredStepMs = 120L
         val wantedSegments = (totalMs / desiredStepMs).toInt().coerceAtLeast(1)
         val segments = wantedSegments.coerceAtMost(maxSegments).coerceAtLeast(1)
         val stepMs = (totalMs / segments).coerceAtLeast(1L)

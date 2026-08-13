@@ -595,21 +595,32 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun isLikelyOverlayRect(rect: android.graphics.Rect, frameW: Int, frameH: Int): Boolean {
-        if (rect.width() < 8 || rect.height() < 6) return false
-        if (rect.width() > frameW * 0.75f || rect.height() > frameH * 0.38f) return false
+        val w = rect.width().toFloat()
+        val h = rect.height().toFloat()
+        if (w < 12f || h < 7f) return false
+        if (w > frameW * 0.55f || h > frameH * 0.16f) return false
 
-        val areaRatio = (rect.width().toFloat() * rect.height().toFloat()) /
-            (frameW.toFloat() * frameH.toFloat())
+        val areaRatio = (w * h) / (frameW.toFloat() * frameH.toFloat())
+        if (areaRatio !in 0.00005f..0.035f) return false
 
-        // Не привязываемся к углам: watermark может лежать по центру,
-        // поверх лица или в любой другой части кадра. Фильтруем только
-        // слишком крупные области, которые почти наверняка являются сценой.
-        return areaRatio in 0.00008f..0.12f
+        val aspect = w / h.coerceAtLeast(1f)
+        if (aspect < 1.15f) return false
+
+        val cx = rect.exactCenterX() / frameW.toFloat()
+        val cy = rect.exactCenterY() / frameH.toFloat()
+        val nearEdge = cx < 0.18f || cx > 0.82f || cy < 0.14f || cy > 0.86f
+        val semiEdge = cx < 0.28f || cx > 0.72f || cy < 0.22f || cy > 0.78f
+
+        return when {
+            nearEdge -> true
+            semiEdge -> aspect >= 1.25f && areaRatio <= 0.028f
+            else -> aspect >= 1.45f && areaRatio <= 0.018f
+        }
     }
 
     private fun paddedVideoRect(source: android.graphics.Rect, frameW: Int, frameH: Int): RectF {
-        val padX = maxOf(8f, source.width() * 0.22f)
-        val padY = maxOf(6f, source.height() * 0.32f)
+        val padX = maxOf(4f, source.width() * 0.10f)
+        val padY = maxOf(3f, source.height() * 0.18f)
 
         val left = (source.left - padX).coerceAtLeast(0f)
         val top = (source.top - padY).coerceAtLeast(0f)
@@ -627,22 +638,13 @@ class EditorActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Настоящий авто-режим для текстовых watermark:
-     * 1) сканирует весь ролик, а не один кадр;
-     * 2) OCR находит повторяющийся текст у краёв кадра;
-     * 3) одинаковый watermark группируется даже при небольших OCR-ошибках;
-     * 4) когда watermark пропал, создаётся active=false;
-     * 5) когда он мгновенно прыгнул после склейки, новая позиция применяется
-     *    сразу, без линейной поездки маски через весь кадр.
-     */
     private fun buildOcrAutoKeyframes(retriever: MediaMetadataRetriever): List<MaskKeyframe> {
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         try {
             val stepMs = when {
-                videoDurationMs <= 20_000L -> 300L
-                videoDurationMs <= 60_000L -> 450L
-                else -> 650L
+                videoDurationMs <= 20_000L -> 250L
+                videoDurationMs <= 60_000L -> 350L
+                else -> 500L
             }
 
             val sampleTimes = mutableListOf<Long>()
@@ -666,7 +668,7 @@ class EditorActivity : AppCompatActivity() {
 
                 val targetWidth = when {
                     frame.width < 720 -> (frame.width * 1.5f).toInt()
-                    frame.width > 1080 -> 1080
+                    frame.width > 960 -> 960
                     else -> frame.width
                 }
                 val targetHeight = maxOf(
@@ -688,7 +690,7 @@ class EditorActivity : AppCompatActivity() {
                     for (line in block.lines) {
                         val box = line.boundingBox ?: continue
                         val key = normalizeWatermarkText(line.text)
-                        if (key.length < 2 || key.length > 48) continue
+                        if (key.length < 2 || key.length > 36) continue
                         if (!isLikelyOverlayRect(box, ocrFrame.width, ocrFrame.height)) continue
 
                         val candidate = OcrCandidate(
@@ -709,7 +711,6 @@ class EditorActivity : AppCompatActivity() {
                 }
 
                 candidatesByTime[timeMs] = frameCandidates
-
                 if (ocrFrame !== frame) ocrFrame.recycle()
                 frame.recycle()
 
@@ -724,68 +725,78 @@ class EditorActivity : AppCompatActivity() {
                 val group: OcrGroup,
                 val score: Float,
                 val medianW: Float,
-                val medianH: Float
+                val medianH: Float,
+                val anchorX: Float,
+                val anchorY: Float,
+                val edgeFraction: Float,
+                val anchorConcentration: Float
             )
 
             val ranked = groups.mapNotNull { group ->
                 val byTime = group.items.groupBy { it.timeMs }
-                val unique = byTime.values.mapNotNull { list -> list.minByOrNull { it.rect.width() * it.rect.height() } }
+                val unique = byTime.values.mapNotNull { list ->
+                    list.minByOrNull { it.rect.width() * it.rect.height() }
+                }
                 if (unique.size < 2) return@mapNotNull null
 
                 val widths = unique.map { it.rect.width() }.sorted()
                 val heights = unique.map { it.rect.height() }.sorted()
+                val centersX = unique.map { it.rect.centerX() }.sorted()
+                val centersY = unique.map { it.rect.centerY() }.sorted()
                 val areas = unique.map { it.rect.width() * it.rect.height() }.sorted()
+                val aspects = unique.map { it.rect.width() / it.rect.height().coerceAtLeast(1f) }
+
                 val medianW = widths[widths.size / 2]
                 val medianH = heights[heights.size / 2]
+                val anchorX = centersX[centersX.size / 2]
+                val anchorY = centersY[centersY.size / 2]
+                val avgAspect = aspects.average().toFloat()
                 val minArea = areas.first().coerceAtLeast(1f)
                 val maxArea = areas.last().coerceAtLeast(minArea)
                 val sizeRatio = maxArea / minArea
-                if (sizeRatio > 4.5f) return@mapNotNull null
+                if (sizeRatio > 3.2f) return@mapNotNull null
+                if (avgAspect < 1.18f) return@mapNotNull null
 
                 val bins = mutableMapOf<String, Int>()
                 var edgeCount = 0
                 for (item in unique) {
                     val nx = (item.rect.centerX() / videoWidth.toFloat()).coerceIn(0f, 0.999f)
                     val ny = (item.rect.centerY() / videoHeight.toFloat()).coerceIn(0f, 0.999f)
-                    val bx = (nx * 5f).toInt().coerceIn(0, 4)
-                    val by = (ny * 7f).toInt().coerceIn(0, 6)
+                    val bx = (nx * 6f).toInt().coerceIn(0, 5)
+                    val by = (ny * 8f).toInt().coerceIn(0, 7)
                     val bin = "$bx:$by"
                     bins[bin] = (bins[bin] ?: 0) + 1
-                    if (nx < 0.20f || nx > 0.80f || ny < 0.16f || ny > 0.84f) {
+                    if (nx < 0.22f || nx > 0.78f || ny < 0.18f || ny > 0.82f) {
                         edgeCount++
                     }
                 }
 
                 val anchorConcentration = (bins.values.maxOrNull() ?: 0).toFloat() / unique.size.toFloat()
                 val edgeFraction = edgeCount.toFloat() / unique.size.toFloat()
-                val spanMs = unique.maxOf { it.timeMs } - unique.minOf { it.timeMs }
-                val positionCompactness = if (bins.size <= 4) 1f else 0f
                 val sizeConsistency = (1f / sizeRatio.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                val mostlyCenter = edgeFraction < 0.45f
+                val strongEnough = if (mostlyCenter) {
+                    unique.size >= 4 && anchorConcentration >= 0.60f && sizeRatio <= 2.6f && avgAspect >= 1.35f
+                } else {
+                    (unique.size >= 3 && anchorConcentration >= 0.45f) ||
+                        (unique.size >= 2 && edgeFraction >= 0.75f && anchorConcentration >= 0.75f)
+                }
 
-                var score = unique.size * 1.7f
-                score += anchorConcentration * 3.0f
-                score += edgeFraction * 2.2f
-                score += positionCompactness * 1.8f
-                score += sizeConsistency * 1.2f
-                if (spanMs >= stepMs * 2) score += 1.0f
-                if (group.key.length in 3..20) score += 0.7f
+                var score = unique.size * 2.0f
+                score += anchorConcentration * 3.5f
+                score += edgeFraction * 2.5f
+                score += sizeConsistency * 1.5f
+                if (avgAspect >= 1.35f) score += 0.8f
+                if (!strongEnough || score < 7.0f) return@mapNotNull null
 
-                val strongEnough = unique.size >= 3 ||
-                    edgeFraction >= 0.60f ||
-                    anchorConcentration >= 0.66f
-
-                if (!strongEnough || score < 6.0f) return@mapNotNull null
-                RankedGroup(group, score, medianW, medianH)
+                RankedGroup(group, score, medianW, medianH, anchorX, anchorY, edgeFraction, anchorConcentration)
             }.sortedByDescending { it.score }
 
             if (ranked.isEmpty()) {
                 throw IllegalStateException("Повторяющийся текстовый watermark не найден")
             }
 
-            // До 6 независимых watermark-треков. В отличие от старой версии
-            // мы НЕ выбираем одну надпись на кадр: несколько треков могут быть
-            // активны одновременно и независимо исчезать/появляться.
-            val accepted = ranked.take(6)
+            val accepted = ranked.take(4)
             val allFrames = mutableListOf<MaskKeyframe>()
             val diagonal = kotlin.math.hypot(videoWidth.toFloat(), videoHeight.toFloat())
 
@@ -798,11 +809,16 @@ class EditorActivity : AppCompatActivity() {
                         .filter { sameWatermarkKey(rankedGroup.group.key, it.key) }
 
                     val chosen = choices.minByOrNull { candidate ->
-                        val dw = kotlin.math.abs(candidate.rect.width() - rankedGroup.medianW) /
-                            rankedGroup.medianW.coerceAtLeast(1f)
-                        val dh = kotlin.math.abs(candidate.rect.height() - rankedGroup.medianH) /
-                            rankedGroup.medianH.coerceAtLeast(1f)
-                        dw + dh
+                        val sizeErr =
+                            kotlin.math.abs(candidate.rect.width() - rankedGroup.medianW) /
+                                rankedGroup.medianW.coerceAtLeast(1f) +
+                            kotlin.math.abs(candidate.rect.height() - rankedGroup.medianH) /
+                                rankedGroup.medianH.coerceAtLeast(1f)
+                        val posErr = kotlin.math.hypot(
+                            candidate.rect.centerX() - rankedGroup.anchorX,
+                            candidate.rect.centerY() - rankedGroup.anchorY
+                        ) / diagonal.coerceAtLeast(1f)
+                        sizeErr + posErr * 1.8f
                     }
 
                     if (chosen == null) {
@@ -816,27 +832,46 @@ class EditorActivity : AppCompatActivity() {
                             )
                         )
                     } else {
-                        val geometryError =
+                        val sizeErr =
                             kotlin.math.abs(chosen.rect.width() - rankedGroup.medianW) /
                                 rankedGroup.medianW.coerceAtLeast(1f) +
                             kotlin.math.abs(chosen.rect.height() - rankedGroup.medianH) /
                                 rankedGroup.medianH.coerceAtLeast(1f)
-                        val confidence = (1f - geometryError * 0.35f).coerceIn(0.35f, 1f)
-                        trackFrames.add(
-                            MaskKeyframe(
-                                timeMs = timeMs,
-                                rect = chosen.rect,
-                                active = true,
-                                trackId = trackId,
-                                confidence = confidence
+                        val posErr = kotlin.math.hypot(
+                            chosen.rect.centerX() - rankedGroup.anchorX,
+                            chosen.rect.centerY() - rankedGroup.anchorY
+                        ) / diagonal.coerceAtLeast(1f)
+
+                        val tooFarForCenter = rankedGroup.edgeFraction < 0.45f && posErr > 0.12f
+                        val tooFarForEdge = rankedGroup.edgeFraction >= 0.45f && posErr > 0.22f
+                        val tooDifferentSize = sizeErr > 0.95f
+
+                        if (tooFarForCenter || tooFarForEdge || tooDifferentSize) {
+                            trackFrames.add(
+                                MaskKeyframe(
+                                    timeMs = timeMs,
+                                    rect = RectF(),
+                                    active = false,
+                                    trackId = trackId,
+                                    confidence = 0f
+                                )
                             )
-                        )
+                        } else {
+                            val confidence = (1f - sizeErr * 0.28f - posErr * 1.6f)
+                                .coerceIn(0.35f, 1f)
+                            trackFrames.add(
+                                MaskKeyframe(
+                                    timeMs = timeMs,
+                                    rect = chosen.rect,
+                                    active = true,
+                                    trackId = trackId,
+                                    confidence = confidence
+                                )
+                            )
+                        }
                     }
                 }
 
-                // Закрываем только одиночный пропуск OCR. Если позиции до/после
-                // сильно отличаются, считаем это скачком/склейкой и не рисуем
-                // маску между ними.
                 for (i in 1 until trackFrames.size - 1) {
                     val current = trackFrames[i]
                     if (current.active) continue
@@ -849,7 +884,7 @@ class EditorActivity : AppCompatActivity() {
                         next.rect.centerY() - prev.rect.centerY()
                     )
 
-                    if (distance <= diagonal * 0.10f) {
+                    if (distance <= diagonal * 0.06f) {
                         trackFrames[i] = MaskKeyframe(
                             timeMs = current.timeMs,
                             rect = RectF(
@@ -860,7 +895,23 @@ class EditorActivity : AppCompatActivity() {
                             ),
                             active = true,
                             trackId = trackId,
-                            confidence = minOf(prev.confidence, next.confidence) * 0.8f
+                            confidence = minOf(prev.confidence, next.confidence) * 0.75f
+                        )
+                    }
+                }
+
+                for (i in trackFrames.indices) {
+                    val current = trackFrames[i]
+                    if (!current.active) continue
+                    val prevActive = i > 0 && trackFrames[i - 1].active
+                    val nextActive = i < trackFrames.lastIndex && trackFrames[i + 1].active
+                    if (!prevActive && !nextActive && current.confidence < 0.70f) {
+                        trackFrames[i] = MaskKeyframe(
+                            timeMs = current.timeMs,
+                            rect = RectF(),
+                            active = false,
+                            trackId = trackId,
+                            confidence = 0f
                         )
                     }
                 }
@@ -1000,9 +1051,9 @@ class EditorActivity : AppCompatActivity() {
         data class RawMatch(val timeMs: Long, val rect: RectF, val score: Float)
         val raw = mutableListOf<RawMatch>()
         val stepMs = when {
-            videoDurationMs <= 20_000L -> 300L
-            videoDurationMs <= 60_000L -> 450L
-            else -> 700L
+            videoDurationMs <= 20_000L -> 250L
+            videoDurationMs <= 60_000L -> 350L
+            else -> 500L
         }
 
         var timeMs = 0L
@@ -1011,8 +1062,8 @@ class EditorActivity : AppCompatActivity() {
             if (frame != null) {
                 val result = findWatermarkOnFrame(frame, template)
                 val found = result.first
-                val padX = maxOf(2f, found.width() * 0.08f)
-                val padY = maxOf(2f, found.height() * 0.12f)
+                val padX = maxOf(1f, found.width() * 0.06f)
+                val padY = maxOf(1f, found.height() * 0.08f)
                 val rect = RectF(
                     ((found.left - padX) / frame.width.toFloat() * videoWidth.toFloat()).coerceAtLeast(0f),
                     ((found.top - padY) / frame.height.toFloat() * videoHeight.toFloat()).coerceAtLeast(0f),
@@ -1036,13 +1087,10 @@ class EditorActivity : AppCompatActivity() {
 
         if (raw.isEmpty()) throw IllegalStateException("Watermark не найден")
 
-        // Старый код всегда выбирал 'лучшее из плохого' и поэтому стирал
-        // случайные области даже когда логотипа уже не было. Теперь вводим
-        // динамический порог: плохие совпадения становятся active=false.
         val scores = raw.map { it.score }.sorted()
-        val lowIndex = ((scores.size - 1) * 0.20f).toInt().coerceIn(0, scores.lastIndex)
+        val lowIndex = ((scores.size - 1) * 0.15f).toInt().coerceIn(0, scores.lastIndex)
         val lowScore = scores[lowIndex]
-        val threshold = (lowScore * 1.75f + 6f).coerceIn(16f, 52f)
+        val threshold = (lowScore * 1.45f + 4f).coerceIn(12f, 40f)
 
         val tracked = raw.map { item ->
             val active = item.score <= threshold
@@ -1058,7 +1106,6 @@ class EditorActivity : AppCompatActivity() {
             )
         }.toMutableList()
 
-        // Референс пользователя — гарантированно положительный пример.
         val nearestRef = tracked.indices.minByOrNull { idx ->
             kotlin.math.abs(tracked[idx].timeMs - referenceTime)
         }
@@ -1070,6 +1117,22 @@ class EditorActivity : AppCompatActivity() {
                 trackId = 0,
                 confidence = 1f
             )
+        }
+
+        for (i in tracked.indices) {
+            val current = tracked[i]
+            if (!current.active) continue
+            val prevActive = i > 0 && tracked[i - 1].active
+            val nextActive = i < tracked.lastIndex && tracked[i + 1].active
+            if (!prevActive && !nextActive && current.confidence < 0.72f) {
+                tracked[i] = MaskKeyframe(
+                    timeMs = current.timeMs,
+                    rect = RectF(),
+                    active = false,
+                    trackId = 0,
+                    confidence = 0f
+                )
+            }
         }
 
         if (tracked.none { it.active }) {
