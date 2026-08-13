@@ -39,6 +39,21 @@ object MaskTracker {
     }
 
     /**
+     * Совместимость с NeuralInpainter.
+     * Для нового трекера берём ближайшее состояние watermark.
+     * Если watermark в этот момент отсутствует — возвращаем пустую маску.
+     */
+    fun interpolate(sortedKeyframes: List<MaskKeyframe>, timeMs: Long): RectF {
+        require(sortedKeyframes.isNotEmpty()) { "Нужен хотя бы один keyframe" }
+        val k = nearest(sortedKeyframes.sortedBy { it.timeMs }, timeMs)
+        return if (k.active) {
+            k.rect
+        } else {
+            RectF(0f, 0f, 0f, 0f)
+        }
+    }
+
+    /**
      * Строит цепочку delogo только там, где watermark реально активен.
      * active=false полностью пропускается, поэтому между появлениями логотипа
      * приложение больше не размывает случайные места кадра.
