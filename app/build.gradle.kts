@@ -48,7 +48,7 @@ dependencies {
     //   implementation("io.github.smedic:ffmpeg-kit-full:6.0.3")     // community fork, пример
     // Если оба недоступны — см. альтернативу в README (сборка своего .aar
     // из https://github.com/ffmpeg-kit форков, либо media3 Transformer + свой native фильтр).
-    implementation("com.arthenica:ffmpeg-kit-full-gpl:6.0-2")
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-full-gpl:8.1.7")
 
     // Для "качественного" режима: нейросетевой inpainting (модель LaMa) на CPU.
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
