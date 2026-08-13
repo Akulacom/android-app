@@ -44,7 +44,7 @@ object VideoProcessor {
         )
 
         FFmpegKit.executeWithArgumentsAsync(
-        arrayOf("-version"),
+            cmd,
             { session: FFmpegSession ->
                 if (ReturnCode.isSuccess(session.returnCode)) {
                     callback.onSuccess(outputPath)
