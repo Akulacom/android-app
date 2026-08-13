@@ -17,6 +17,10 @@ import android.widget.SeekBar
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.akula.watermarkremover.databinding.ActivityEditorBinding
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 
 class EditorActivity : AppCompatActivity() {
@@ -50,6 +54,18 @@ class EditorActivity : AppCompatActivity() {
         val rect: Rect,
         val zoneId: String,
         val zoneScore: Float
+    )
+
+    private data class OcrCandidate(
+        val timeMs: Long,
+        val key: String,
+        val rect: RectF,
+        val text: String
+    )
+
+    private data class OcrGroup(
+        val key: String,
+        val items: MutableList<OcrCandidate> = mutableListOf()
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -533,6 +549,253 @@ class EditorActivity : AppCompatActivity() {
         )
     }
 
+    private fun normalizeWatermarkText(value: String): String {
+        return value
+            .lowercase()
+            .filter { it.isLetterOrDigit() }
+            .replace('0', 'o')
+            .replace('1', 'i')
+            .replace('l', 'i')
+    }
+
+    private fun editDistance(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+
+        var previous = IntArray(b.length + 1) { it }
+        var current = IntArray(b.length + 1)
+
+        for (i in a.indices) {
+            current[0] = i + 1
+            for (j in b.indices) {
+                val cost = if (a[i] == b[j]) 0 else 1
+                current[j + 1] = minOf(
+                    current[j] + 1,
+                    previous[j + 1] + 1,
+                    previous[j] + cost
+                )
+            }
+            val swap = previous
+            previous = current
+            current = swap
+        }
+        return previous[b.length]
+    }
+
+    private fun sameWatermarkKey(a: String, b: String): Boolean {
+        if (a == b) return true
+        if (a.length >= 3 && b.length >= 3 && (a.contains(b) || b.contains(a))) return true
+        val minLen = minOf(a.length, b.length)
+        if (minLen < 3) return false
+        val allowed = maxOf(1, minLen / 4)
+        return editDistance(a, b) <= allowed
+    }
+
+    private fun isLikelyOverlayRect(rect: android.graphics.Rect, frameW: Int, frameH: Int): Boolean {
+        if (rect.width() < 8 || rect.height() < 6) return false
+        if (rect.width() > frameW * 0.55f || rect.height() > frameH * 0.25f) return false
+
+        val areaRatio = (rect.width().toFloat() * rect.height().toFloat()) /
+            (frameW.toFloat() * frameH.toFloat())
+        if (areaRatio > 0.08f) return false
+
+        val cx = rect.exactCenterX() / frameW.toFloat()
+        val cy = rect.exactCenterY() / frameH.toFloat()
+
+        // Watermark обычно держится ближе к краям. Боковые зоны разрешаем
+        // по всей высоте, чтобы ловить Dola AI слева посередине.
+        return cx <= 0.38f || cx >= 0.62f || cy <= 0.22f || cy >= 0.78f
+    }
+
+    private fun paddedVideoRect(source: android.graphics.Rect, frameW: Int, frameH: Int): RectF {
+        val padX = maxOf(8f, source.width() * 0.22f)
+        val padY = maxOf(6f, source.height() * 0.32f)
+
+        val left = (source.left - padX).coerceAtLeast(0f)
+        val top = (source.top - padY).coerceAtLeast(0f)
+        val right = (source.right + padX).coerceAtMost(frameW.toFloat())
+        val bottom = (source.bottom + padY).coerceAtMost(frameH.toFloat())
+
+        val scaleX = videoWidth.toFloat() / frameW.toFloat()
+        val scaleY = videoHeight.toFloat() / frameH.toFloat()
+
+        return RectF(
+            left * scaleX,
+            top * scaleY,
+            right * scaleX,
+            bottom * scaleY
+        )
+    }
+
+    /**
+     * Настоящий авто-режим для текстовых watermark:
+     * 1) сканирует весь ролик, а не один кадр;
+     * 2) OCR находит повторяющийся текст у краёв кадра;
+     * 3) одинаковый watermark группируется даже при небольших OCR-ошибках;
+     * 4) когда watermark пропал, создаётся active=false;
+     * 5) когда он мгновенно прыгнул после склейки, новая позиция применяется
+     *    сразу, без линейной поездки маски через весь кадр.
+     */
+    private fun buildOcrAutoKeyframes(retriever: MediaMetadataRetriever): List<MaskKeyframe> {
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        try {
+            val stepMs = when {
+                videoDurationMs <= 20_000L -> 350L
+                videoDurationMs <= 60_000L -> 500L
+                else -> 750L
+            }
+
+            val sampleTimes = mutableListOf<Long>()
+            var t = 0L
+            while (t <= videoDurationMs) {
+                sampleTimes.add(t)
+                t += stepMs
+            }
+            if (sampleTimes.isEmpty() || sampleTimes.last() < videoDurationMs) {
+                sampleTimes.add(videoDurationMs)
+            }
+
+            val candidatesByTime = linkedMapOf<Long, MutableList<OcrCandidate>>()
+            val groups = mutableListOf<OcrGroup>()
+
+            for ((index, timeMs) in sampleTimes.withIndex()) {
+                val frame = retriever.getFrameAtTime(
+                    timeMs * 1000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST
+                ) ?: continue
+
+                val ocrFrame = if (frame.width < 900) {
+                    val scale = 1.6f
+                    Bitmap.createScaledBitmap(
+                        frame,
+                        (frame.width * scale).toInt(),
+                        (frame.height * scale).toInt(),
+                        true
+                    )
+                } else {
+                    frame
+                }
+
+                val image = InputImage.fromBitmap(ocrFrame, 0)
+                val result = Tasks.await(recognizer.process(image))
+                val frameCandidates = mutableListOf<OcrCandidate>()
+
+                for (block in result.textBlocks) {
+                    for (line in block.lines) {
+                        val box = line.boundingBox ?: continue
+                        val key = normalizeWatermarkText(line.text)
+                        if (key.length < 2 || key.length > 40) continue
+                        if (!isLikelyOverlayRect(box, ocrFrame.width, ocrFrame.height)) continue
+
+                        val candidate = OcrCandidate(
+                            timeMs = timeMs,
+                            key = key,
+                            rect = paddedVideoRect(box, ocrFrame.width, ocrFrame.height),
+                            text = line.text
+                        )
+                        frameCandidates.add(candidate)
+
+                        var group = groups.firstOrNull { sameWatermarkKey(it.key, key) }
+                        if (group == null) {
+                            group = OcrGroup(key)
+                            groups.add(group)
+                        }
+                        group.items.add(candidate)
+                    }
+                }
+
+                candidatesByTime[timeMs] = frameCandidates
+
+                if (ocrFrame !== frame) ocrFrame.recycle()
+                frame.recycle()
+
+                val percent = (((index + 1).toFloat() / sampleTimes.size.toFloat()) * 100f)
+                    .toInt().coerceIn(0, 100)
+                runOnUiThread {
+                    binding.tvStatus.text = "Поиск watermark: $percent%"
+                }
+            }
+
+            val validGroups = groups
+                .filter { it.items.size >= 2 }
+                .sortedByDescending { it.items.size }
+
+            if (validGroups.isEmpty()) {
+                throw IllegalStateException(
+                    "Повторяющийся текстовый watermark не найден"
+                )
+            }
+
+            // Берём все устойчивые повторяющиеся подписи, но не более трёх.
+            // Это позволяет одному ролику иметь разные watermark в разных сценах.
+            val accepted = validGroups.take(3)
+
+            fun groupRank(candidate: OcrCandidate): Int {
+                val index = accepted.indexOfFirst { sameWatermarkKey(it.key, candidate.key) }
+                return if (index < 0) Int.MAX_VALUE else index
+            }
+
+            val resultFrames = mutableListOf<MaskKeyframe>()
+            for (timeMs in sampleTimes) {
+                val choices = candidatesByTime[timeMs]
+                    .orEmpty()
+                    .filter { groupRank(it) != Int.MAX_VALUE }
+                    .sortedWith(
+                        compareBy<OcrCandidate> { groupRank(it) }
+                            .thenBy { it.rect.width() * it.rect.height() }
+                    )
+
+                val chosen = choices.firstOrNull()
+                if (chosen == null) {
+                    resultFrames.add(MaskKeyframe(timeMs, RectF(), active = false))
+                } else {
+                    resultFrames.add(MaskKeyframe(timeMs, chosen.rect, active = true))
+                }
+            }
+
+            // Закрываем единичные OCR-пропуски между двумя близкими позициями.
+            // Длинные промежутки остаются inactive — там watermark не трогаем.
+            for (i in 1 until resultFrames.size - 1) {
+                val current = resultFrames[i]
+                if (current.active) continue
+
+                val prev = resultFrames[i - 1]
+                val next = resultFrames[i + 1]
+                if (!prev.active || !next.active) continue
+
+                val prevCx = prev.rect.centerX()
+                val prevCy = prev.rect.centerY()
+                val nextCx = next.rect.centerX()
+                val nextCy = next.rect.centerY()
+                val distance = kotlin.math.hypot(nextCx - prevCx, nextCy - prevCy)
+                val diagonal = kotlin.math.hypot(videoWidth.toFloat(), videoHeight.toFloat())
+
+                if (distance <= diagonal * 0.12f) {
+                    resultFrames[i] = MaskKeyframe(
+                        current.timeMs,
+                        RectF(
+                            (prev.rect.left + next.rect.left) / 2f,
+                            (prev.rect.top + next.rect.top) / 2f,
+                            (prev.rect.right + next.rect.right) / 2f,
+                            (prev.rect.bottom + next.rect.bottom) / 2f
+                        ),
+                        active = true
+                    )
+                }
+            }
+
+            val activeCount = resultFrames.count { it.active }
+            if (activeCount < 2) {
+                throw IllegalStateException("Watermark найден слишком неуверенно")
+            }
+
+            return resultFrames
+        } finally {
+            recognizer.close()
+        }
+    }
+
     private fun detectAutomaticSeed(
         retriever: MediaMetadataRetriever,
         trackingWidth: Int
@@ -715,21 +978,17 @@ class EditorActivity : AppCompatActivity() {
                 retriever.setDataSource(this, videoUri)
                 val trackingWidth = 360
 
-                val seed = if (manualRect != null) {
-                    binding.videoView.currentPosition.toLong() to manualRect
+                val tracked = if (manualRect == null) {
+                    buildOcrAutoKeyframes(retriever)
                 } else {
-                    detectAutomaticSeed(retriever, trackingWidth)
-                        ?: throw IllegalStateException(
-                            "Авто не нашёл явный watermark. Для сложного ролика обведи лого вручную."
-                        )
+                    val seed = binding.videoView.currentPosition.toLong() to manualRect
+                    buildTrackedKeyframes(
+                        retriever = retriever,
+                        referenceTime = seed.first,
+                        sourceRect = seed.second,
+                        trackingWidth = trackingWidth
+                    )
                 }
-
-                val tracked = buildTrackedKeyframes(
-                    retriever = retriever,
-                    referenceTime = seed.first,
-                    sourceRect = seed.second,
-                    trackingWidth = trackingWidth
-                )
 
                 runOnUiThread {
                     keyframes.clear()
@@ -743,11 +1002,11 @@ class EditorActivity : AppCompatActivity() {
                     } else {
                         binding.progressBar.visibility = android.view.View.INVISIBLE
                         binding.btnApply.isEnabled = true
-                        binding.tvStatus.text = "Автотрекинг готов: ${tracked.size} точек"
+                        binding.tvStatus.text = "Автотрекинг готов: ${tracked.count { it.active }} активных точек"
                         val doneMessage = if (manualRect != null) {
                             "Плавающий watermark отслежен"
                         } else {
-                            "Watermark найден автоматически"
+                            "Watermark найден по всему ролику"
                         }
                         Toast.makeText(this, doneMessage, Toast.LENGTH_LONG).show()
                     }
@@ -787,14 +1046,12 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun updateKeyframeLabel() {
-        binding.tvKeyframes.text = "Точек трекинга: ${keyframes.size}" +
-            if (keyframes.size == 1) {
-                " (маска статична)"
-            } else if (keyframes.size > 1) {
-                " (маска едет по интерполяции)"
-            } else {
-                ""
-            }
+        val active = keyframes.count { it.active }
+        binding.tvKeyframes.text = when {
+            keyframes.isEmpty() -> "Точек трекинга: 0"
+            keyframes.size == 1 -> "Точек трекинга: 1 (маска статична)"
+            else -> "Точек трекинга: $active активных / ${keyframes.size} проверок"
+        }
     }
 
     private fun onApplyClicked() {

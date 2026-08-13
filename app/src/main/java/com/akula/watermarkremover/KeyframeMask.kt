@@ -3,89 +3,93 @@ package com.akula.watermarkremover
 import android.graphics.RectF
 
 /**
- * Одна "точка" трекинга: положение маски (в реальных пикселях видео)
- * в конкретный момент времени.
+ * Одна точка трекинга. active=false означает, что в этот момент watermark
+ * отсутствует и никакой delogo применять нельзя.
  */
-data class MaskKeyframe(val timeMs: Long, val rect: RectF)
+data class MaskKeyframe(
+    val timeMs: Long,
+    val rect: RectF,
+    val active: Boolean = true
+)
 
-/**
- * Линейная интерполяция прямоугольника маски между ключевыми кадрами.
- * Если кадр один — маска статична на всё видео (старое поведение).
- * Если кадров несколько — между ними считается линейное движение
- * (простой трекинг без компьютерного зрения, но для большинства
- * вотермарков, которые двигаются предсказуемо/по прямой, этого достаточно).
- */
 object MaskTracker {
 
-    fun interpolate(sortedKeyframes: List<MaskKeyframe>, timeMs: Long): RectF {
-        require(sortedKeyframes.isNotEmpty()) { "Нужен хотя бы один keyframe" }
-        if (sortedKeyframes.size == 1) return sortedKeyframes[0].rect
+    /**
+     * Для авто-режима нам НЕ нужна линейная "поездка" маски между далёкими
+     * позициями: watermark может мгновенно прыгнуть после монтажной склейки.
+     * Поэтому берём ближайшую по времени точку. При частом семплировании
+     * (300-500 мс) это даёт стабильную ступенчатую траекторию без размазывания
+     * маски через весь кадр.
+     */
+    private fun nearest(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
+        if (sorted.size == 1) return sorted[0]
+        if (timeMs <= sorted.first().timeMs) return sorted.first()
+        if (timeMs >= sorted.last().timeMs) return sorted.last()
 
-        val first = sortedKeyframes.first()
-        val last = sortedKeyframes.last()
-        if (timeMs <= first.timeMs) return first.rect
-        if (timeMs >= last.timeMs) return last.rect
-
-        for (i in 0 until sortedKeyframes.size - 1) {
-            val a = sortedKeyframes[i]
-            val b = sortedKeyframes[i + 1]
-            if (timeMs in a.timeMs..b.timeMs) {
-                val span = (b.timeMs - a.timeMs).coerceAtLeast(1)
-                val frac = (timeMs - a.timeMs).toFloat() / span.toFloat()
-                return RectF(
-                    lerp(a.rect.left, b.rect.left, frac),
-                    lerp(a.rect.top, b.rect.top, frac),
-                    lerp(a.rect.right, b.rect.right, frac),
-                    lerp(a.rect.bottom, b.rect.bottom, frac)
-                )
+        var best = sorted.first()
+        var bestDistance = kotlin.math.abs(best.timeMs - timeMs)
+        for (item in sorted) {
+            val distance = kotlin.math.abs(item.timeMs - timeMs)
+            if (distance < bestDistance) {
+                best = item
+                bestDistance = distance
             }
         }
-        return last.rect
+        return best
     }
 
-    private fun lerp(a: Float, b: Float, t: Float): Float = a + (b - a) * t
-
     /**
-     * Строит цепочку FFmpeg-фильтров delogo: видео режется на короткие
-     * отрезки времени (enable=between(t,t0,t1)), для каждого отрезка
-     * координаты маски берутся из интерполяции. Итог — маска "едет"
-     * ступенчато по кадрам видео вслед за вотермарком.
-     *
-     * maxSegments ограничивает длину цепочки фильтров, чтобы команда
-     * FFmpeg не разрослась до неадекватного размера на длинных видео.
+     * Строит цепочку delogo только там, где watermark реально активен.
+     * active=false полностью пропускается, поэтому между появлениями логотипа
+     * приложение больше не размывает случайные места кадра.
      */
     fun buildTrackedDelogoFilter(
         keyframes: List<MaskKeyframe>,
         durationMs: Long,
-        maxSegments: Int = 120
+        maxSegments: Int = 180
     ): String {
         val sorted = keyframes.sortedBy { it.timeMs }
+        require(sorted.isNotEmpty()) { "Нужен хотя бы один keyframe" }
+
         if (sorted.size == 1) {
-            val r = sorted[0].rect
+            val k = sorted[0]
+            if (!k.active || k.rect.width() < 2f || k.rect.height() < 2f) return "null"
+            val r = k.rect
             return "delogo=x=${r.left.toInt()}:y=${r.top.toInt()}:" +
-                "w=${r.width().toInt()}:h=${r.height().toInt()}:show=0"
+                "w=${r.width().toInt().coerceAtLeast(2)}:" +
+                "h=${r.height().toInt().coerceAtLeast(2)}:show=0"
         }
 
-        val totalMs = durationMs.coerceAtLeast(1)
-        val segments = maxSegments.coerceAtMost((totalMs / 150).toInt().coerceAtLeast(1))
-        val stepMs = totalMs / segments
+        val totalMs = durationMs.coerceAtLeast(1L)
+        val desiredStepMs = 250L
+        val wantedSegments = (totalMs / desiredStepMs).toInt().coerceAtLeast(1)
+        val segments = wantedSegments.coerceAtMost(maxSegments).coerceAtLeast(1)
+        val stepMs = (totalMs / segments).coerceAtLeast(1L)
 
-        val sb = StringBuilder()
+        val filters = ArrayList<String>()
         for (i in 0 until segments) {
             val t0 = i * stepMs
             val t1 = if (i == segments - 1) totalMs else (i + 1) * stepMs
-            val midT = (t0 + t1) / 2
-            val rect = interpolate(sorted, midT)
+            val mid = (t0 + t1) / 2L
+            val k = nearest(sorted, mid)
+            if (!k.active) continue
+
+            val r = k.rect
+            if (r.width() < 2f || r.height() < 2f) continue
+
+            val x = r.left.toInt().coerceAtLeast(0)
+            val y = r.top.toInt().coerceAtLeast(0)
+            val w = r.width().toInt().coerceAtLeast(2)
+            val h = r.height().toInt().coerceAtLeast(2)
             val t0s = t0 / 1000.0
             val t1s = t1 / 1000.0
-            sb.append(
-                "delogo=x=${rect.left.toInt()}:y=${rect.top.toInt()}:" +
-                    "w=${rect.width().toInt().coerceAtLeast(2)}:" +
-                    "h=${rect.height().toInt().coerceAtLeast(2)}:show=0:" +
+
+            filters.add(
+                "delogo=x=$x:y=$y:w=$w:h=$h:show=0:" +
                     "enable='between(t,$t0s,$t1s)'"
             )
-            if (i != segments - 1) sb.append(",")
         }
-        return sb.toString()
+
+        return if (filters.isEmpty()) "null" else filters.joinToString(",")
     }
 }
