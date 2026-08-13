@@ -96,19 +96,110 @@ class EditorActivity : AppCompatActivity() {
 
     /** Переводит текущую рамку маски (в пикселях View) в пиксели видео. */
     private fun currentMaskInVideoCoords(): RectF? {
-        if (!binding.maskOverlay.hasMask() || videoWidth == 0 || videoHeight == 0) return null
-        val viewW = binding.maskOverlay.width.toFloat()
-        val viewH = binding.maskOverlay.height.toFloat()
-        val rect = binding.maskOverlay.maskRect
+        if (!binding.maskOverlay.hasMask() ||
+            videoWidth <= 0 ||
+            videoHeight <= 0
+        ) return null
 
-        val scaleX = videoWidth / viewW
-        val scaleY = videoHeight / viewH
+        val overlay = binding.maskOverlay
+        val video = binding.videoView
+
+        val viewW = video.width.toFloat()
+        val viewH = video.height.toFloat()
+
+        if (viewW <= 0f || viewH <= 0f) return null
+
+        // Реальное положение VideoView относительно MaskOverlay.
+        // Работает даже если они находятся в разных контейнерах.
+        val videoLocation = IntArray(2)
+        val overlayLocation = IntArray(2)
+
+        video.getLocationOnScreen(videoLocation)
+        overlay.getLocationOnScreen(overlayLocation)
+
+        val videoViewLeft =
+            (videoLocation[0] - overlayLocation[0]).toFloat()
+        val videoViewTop =
+            (videoLocation[1] - overlayLocation[1]).toFloat()
+
+        // Находим фактический прямоугольник изображения внутри VideoView
+        // с учётом сохранения пропорций видео.
+        val sourceAspect =
+            videoWidth.toFloat() / videoHeight.toFloat()
+
+        val viewAspect =
+            viewW / viewH
+
+        val contentW: Float
+        val contentH: Float
+        val contentLeft: Float
+        val contentTop: Float
+
+        if (viewAspect > sourceAspect) {
+            contentH = viewH
+            contentW = viewH * sourceAspect
+
+            contentLeft =
+                videoViewLeft + (viewW - contentW) / 2f
+            contentTop =
+                videoViewTop
+        } else {
+            contentW = viewW
+            contentH = viewW / sourceAspect
+
+            contentLeft =
+                videoViewLeft
+            contentTop =
+                videoViewTop + (viewH - contentH) / 2f
+        }
+
+        val sourceRect = overlay.maskRect
+
+        val contentRight = contentLeft + contentW
+        val contentBottom = contentTop + contentH
+
+        val left =
+            sourceRect.left.coerceIn(
+                contentLeft,
+                contentRight - 2f
+            )
+
+        val top =
+            sourceRect.top.coerceIn(
+                contentTop,
+                contentBottom - 2f
+            )
+
+        val right =
+            sourceRect.right.coerceIn(
+                left + 2f,
+                contentRight
+            )
+
+        val bottom =
+            sourceRect.bottom.coerceIn(
+                top + 2f,
+                contentBottom
+            )
+
+        val scaleX =
+            videoWidth.toFloat() / contentW
+
+        val scaleY =
+            videoHeight.toFloat() / contentH
 
         return RectF(
-            (rect.left * scaleX).coerceIn(0f, videoWidth - 2f),
-            (rect.top * scaleY).coerceIn(0f, videoHeight - 2f),
-            (rect.right * scaleX).coerceIn(2f, videoWidth.toFloat()),
-            (rect.bottom * scaleY).coerceIn(2f, videoHeight.toFloat())
+            ((left - contentLeft) * scaleX)
+                .coerceIn(0f, videoWidth.toFloat() - 2f),
+
+            ((top - contentTop) * scaleY)
+                .coerceIn(0f, videoHeight.toFloat() - 2f),
+
+            ((right - contentLeft) * scaleX)
+                .coerceIn(2f, videoWidth.toFloat()),
+
+            ((bottom - contentTop) * scaleY)
+                .coerceIn(2f, videoHeight.toFloat())
         )
     }
 
