@@ -132,8 +132,6 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun onApplyClicked() {
-        onProcessingError("TEST_NO_FFMPEG: обработчик кнопки работает")
-        return
         // Если пользователь не нажал "Добавить точку" ни разу, но нарисовал
         // рамку — считаем это одной статичной точкой на текущем времени.
         if (keyframes.isEmpty()) {
