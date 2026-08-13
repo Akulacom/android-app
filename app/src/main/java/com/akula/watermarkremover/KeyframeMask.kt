@@ -63,6 +63,60 @@ object MaskTracker {
     }
 
     /**
+     * V3-детектор может разделить один и тот же прыгающий watermark на несколько
+     * коротких trackId. Для delogo это не нужно: nearest() уже умеет мгновенно
+     * переносить прямоугольник между позициями без линейного размазывания.
+     *
+     * Если в одну и ту же временную точку активен только один watermark,
+     * собираем такие куски обратно в одну хронологию. Если реально есть два
+     * watermark одновременно, исходный multi-track режим сохраняется.
+     */
+    private fun normalizeTracksForDelogo(
+        keyframes: List<MaskKeyframe>
+    ): Map<Int, List<MaskKeyframe>> {
+        val originalTracks = keyframes.groupBy { it.trackId }
+        if (originalTracks.size <= 1) return originalTracks
+
+        val hasSimultaneousWatermarks = keyframes
+            .filter { it.active && it.rect.width() >= 2f && it.rect.height() >= 2f }
+            .groupBy { it.timeMs }
+            .values
+            .any { states -> states.map { it.trackId }.distinct().size > 1 }
+
+        if (hasSimultaneousWatermarks) return originalTracks
+
+        val merged = keyframes
+            .groupBy { it.timeMs }
+            .toSortedMap()
+            .map { (timeMs, states) ->
+                val activeState = states
+                    .filter {
+                        it.active &&
+                            it.rect.width() >= 2f &&
+                            it.rect.height() >= 2f
+                    }
+                    .maxByOrNull { it.confidence }
+
+                if (activeState != null) {
+                    activeState.copy(
+                        timeMs = timeMs,
+                        trackId = 0
+                    )
+                } else {
+                    MaskKeyframe(
+                        timeMs = timeMs,
+                        rect = RectF(),
+                        active = false,
+                        trackId = 0,
+                        confidence = 0f
+                    )
+                }
+            }
+
+        return mapOf(0 to merged)
+    }
+
+    /**
      * Строит FFmpeg delogo-цепочку для всех независимых trackId.
      * Каждый трек включается только в тех временных сегментах, где active=true.
      * Поэтому один watermark может исчезнуть, другой появиться, а два могут
@@ -75,7 +129,7 @@ object MaskTracker {
     ): String {
         require(keyframes.isNotEmpty()) { "Нужен хотя бы один keyframe" }
 
-        val tracks = keyframes.groupBy { it.trackId }
+        val tracks = normalizeTracksForDelogo(keyframes)
         val totalMs = durationMs.coerceAtLeast(1L)
         val desiredStepMs = 120L
         val wantedSegments = (totalMs / desiredStepMs).toInt().coerceAtLeast(1)
