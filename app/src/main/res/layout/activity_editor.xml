@@ -111,6 +111,20 @@
         android:text="" />
 
     <Button
+        android:id="@+id/btnAutoTrack"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Автотрекинг плавающего watermark"
+        android:textAllCaps="false" />
+
+    <CheckBox
+        android:id="@+id/cbDeleteInternal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="После сохранения удалить внутреннюю копию"
+        android:checked="false" />
+
+    <Button
         android:id="@+id/btnApply"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

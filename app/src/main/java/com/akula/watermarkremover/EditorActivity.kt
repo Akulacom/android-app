@@ -1,4 +1,6 @@
 package com.akula.watermarkremover
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.provider.MediaStore
 import android.os.Build
 import android.content.ContentValues
@@ -33,6 +35,16 @@ class EditorActivity : AppCompatActivity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var trackingSeekBar = false
 
+    private data class TrackerTemplate(
+        val width: Int,
+        val height: Int,
+        val xs: IntArray,
+        val ys: IntArray,
+        val gx: IntArray,
+        val gy: IntArray
+    )
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityEditorBinding.inflate(layoutInflater)
@@ -66,6 +78,21 @@ class EditorActivity : AppCompatActivity() {
             keyframes.clear()
             updateKeyframeLabel()
             Toast.makeText(this, "Точки трекинга сброшены", Toast.LENGTH_SHORT).show()
+        }
+
+        binding.btnAutoTrack.setOnClickListener {
+            autoTrackWatermark()
+        }
+
+        val prefs = getSharedPreferences("watermark_settings", MODE_PRIVATE)
+
+        binding.cbDeleteInternal.isChecked =
+            prefs.getBoolean("delete_internal", false)
+
+        binding.cbDeleteInternal.setOnCheckedChangeListener { _, checked ->
+            prefs.edit()
+                .putBoolean("delete_internal", checked)
+                .apply()
         }
 
         binding.btnApply.setOnClickListener { try { binding.videoView.pause(); onApplyClicked() } catch (t: Throwable) { binding.btnApply.isEnabled = true; binding.progressBar.visibility = android.view.View.INVISIBLE; val msg = "Ошибка запуска: ${t.javaClass.simpleName}: ${t.message}"; binding.tvStatus.text = msg; Toast.makeText(this, msg, Toast.LENGTH_LONG).show() } }
@@ -206,6 +233,507 @@ class EditorActivity : AppCompatActivity() {
         )
     }
 
+
+    private fun grayValue(pixel: Int): Int {
+        return (
+            Color.red(pixel) * 30 +
+            Color.green(pixel) * 59 +
+            Color.blue(pixel) * 11
+        ) / 100
+    }
+
+    private fun bitmapToGray(bitmap: Bitmap): IntArray {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val pixels = IntArray(width * height)
+
+        bitmap.getPixels(
+            pixels,
+            0,
+            width,
+            0,
+            0,
+            width,
+            height
+        )
+
+        for (i in pixels.indices) {
+            pixels[i] = grayValue(pixels[i])
+        }
+
+        return pixels
+    }
+
+    private fun buildTrackerTemplate(bitmap: Bitmap): TrackerTemplate {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val gray = bitmapToGray(bitmap)
+
+        val xs = ArrayList<Int>()
+        val ys = ArrayList<Int>()
+        val gxList = ArrayList<Int>()
+        val gyList = ArrayList<Int>()
+
+        val sampleStep =
+            maxOf(1, minOf(width, height) / 12)
+
+        for (y in 1 until height - 1 step sampleStep) {
+            for (x in 1 until width - 1 step sampleStep) {
+                val index = y * width + x
+
+                val gx =
+                    gray[index + 1] -
+                    gray[index - 1]
+
+                val gy =
+                    gray[index + width] -
+                    gray[index - width]
+
+                val strength =
+                    kotlin.math.abs(gx) +
+                    kotlin.math.abs(gy)
+
+                // Берём в первую очередь края букв/логотипа.
+                if (strength >= 18) {
+                    xs.add(x)
+                    ys.add(y)
+                    gxList.add(gx)
+                    gyList.add(gy)
+                }
+            }
+        }
+
+        // Если логотип слишком гладкий — используем обычную сетку.
+        if (xs.size < 15) {
+            xs.clear()
+            ys.clear()
+            gxList.clear()
+            gyList.clear()
+
+            val fallbackStep =
+                maxOf(1, minOf(width, height) / 10)
+
+            for (y in 1 until height - 1 step fallbackStep) {
+                for (x in 1 until width - 1 step fallbackStep) {
+                    val index = y * width + x
+
+                    xs.add(x)
+                    ys.add(y)
+
+                    gxList.add(
+                        gray[index + 1] -
+                        gray[index - 1]
+                    )
+
+                    gyList.add(
+                        gray[index + width] -
+                        gray[index - width]
+                    )
+                }
+            }
+        }
+
+        return TrackerTemplate(
+            width = width,
+            height = height,
+            xs = xs.toIntArray(),
+            ys = ys.toIntArray(),
+            gx = gxList.toIntArray(),
+            gy = gyList.toIntArray()
+        )
+    }
+
+    private fun findWatermarkOnFrame(
+        bitmap: Bitmap,
+        template: TrackerTemplate
+    ): Pair<Rect, Float> {
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        val gray = bitmapToGray(bitmap)
+
+        val maxX = width - template.width
+        val maxY = height - template.height
+
+        if (maxX <= 0 || maxY <= 0) {
+            return Pair(
+                Rect(
+                    0,
+                    0,
+                    template.width.coerceAtMost(width),
+                    template.height.coerceAtMost(height)
+                ),
+                Float.MAX_VALUE
+            )
+        }
+
+        var bestX = 0
+        var bestY = 0
+        var bestScore = Float.MAX_VALUE
+
+        fun scoreAt(originX: Int, originY: Int): Float {
+            var total = 0L
+
+            for (i in template.xs.indices) {
+                val x = originX + template.xs[i]
+                val y = originY + template.ys[i]
+
+                val index = y * width + x
+
+                val gx =
+                    gray[index + 1] -
+                    gray[index - 1]
+
+                val gy =
+                    gray[index + width] -
+                    gray[index - width]
+
+                total +=
+                    kotlin.math.abs(gx - template.gx[i]) +
+                    kotlin.math.abs(gy - template.gy[i])
+            }
+
+            return if (template.xs.isEmpty()) {
+                Float.MAX_VALUE
+            } else {
+                total.toFloat() /
+                    (template.xs.size * 2f)
+            }
+        }
+
+        // Сначала быстрый поиск по всему кадру.
+        val searchStep = 3
+
+        var y = 0
+
+        while (y <= maxY) {
+            var x = 0
+
+            while (x <= maxX) {
+                val score = scoreAt(x, y)
+
+                if (score < bestScore) {
+                    bestScore = score
+                    bestX = x
+                    bestY = y
+                }
+
+                x += searchStep
+            }
+
+            y += searchStep
+        }
+
+        // Затем уточняем позицию с точностью до пикселя.
+        val refineLeft =
+            (bestX - 4).coerceAtLeast(0)
+
+        val refineRight =
+            (bestX + 4).coerceAtMost(maxX)
+
+        val refineTop =
+            (bestY - 4).coerceAtLeast(0)
+
+        val refineBottom =
+            (bestY + 4).coerceAtMost(maxY)
+
+        for (ry in refineTop..refineBottom) {
+            for (rx in refineLeft..refineRight) {
+                val score = scoreAt(rx, ry)
+
+                if (score < bestScore) {
+                    bestScore = score
+                    bestX = rx
+                    bestY = ry
+                }
+            }
+        }
+
+        return Pair(
+            Rect(
+                bestX,
+                bestY,
+                bestX + template.width,
+                bestY + template.height
+            ),
+            bestScore
+        )
+    }
+
+    private fun autoTrackWatermark() {
+        val sourceRect = currentMaskInVideoCoords()
+
+        if (sourceRect == null) {
+            Toast.makeText(
+                this,
+                "Сначала обведи watermark красной рамкой",
+                Toast.LENGTH_LONG
+            ).show()
+
+            return
+        }
+
+        if (videoWidth <= 0 ||
+            videoHeight <= 0 ||
+            videoDurationMs <= 0
+        ) {
+            Toast.makeText(
+                this,
+                "Не удалось получить параметры видео",
+                Toast.LENGTH_LONG
+            ).show()
+
+            return
+        }
+
+        binding.videoView.pause()
+        binding.btnAutoTrack.isEnabled = false
+
+        val referenceTime =
+            binding.videoView.currentPosition.toLong()
+
+        binding.tvStatus.text =
+            "Подготовка автотрекинга..."
+
+        Thread {
+            val retriever = MediaMetadataRetriever()
+
+            try {
+                retriever.setDataSource(this, videoUri)
+
+                val referenceFrame =
+                    retriever.getFrameAtTime(
+                        referenceTime * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST
+                    ) ?: throw IllegalStateException(
+                        "Не удалось получить исходный кадр"
+                    )
+
+                val trackingWidth = 360
+
+                val trackingHeight =
+                    maxOf(
+                        1,
+                        (
+                            referenceFrame.height *
+                            trackingWidth.toFloat() /
+                            referenceFrame.width.toFloat()
+                        ).toInt()
+                    )
+
+                val referenceScaled =
+                    Bitmap.createScaledBitmap(
+                        referenceFrame,
+                        trackingWidth,
+                        trackingHeight,
+                        true
+                    )
+
+                val left =
+                    (
+                        sourceRect.left /
+                        videoWidth.toFloat() *
+                        referenceScaled.width
+                    ).toInt().coerceIn(
+                        0,
+                        referenceScaled.width - 2
+                    )
+
+                val top =
+                    (
+                        sourceRect.top /
+                        videoHeight.toFloat() *
+                        referenceScaled.height
+                    ).toInt().coerceIn(
+                        0,
+                        referenceScaled.height - 2
+                    )
+
+                val right =
+                    (
+                        sourceRect.right /
+                        videoWidth.toFloat() *
+                        referenceScaled.width
+                    ).toInt().coerceIn(
+                        left + 2,
+                        referenceScaled.width
+                    )
+
+                val bottom =
+                    (
+                        sourceRect.bottom /
+                        videoHeight.toFloat() *
+                        referenceScaled.height
+                    ).toInt().coerceIn(
+                        top + 2,
+                        referenceScaled.height
+                    )
+
+                val templateBitmap =
+                    Bitmap.createBitmap(
+                        referenceScaled,
+                        left,
+                        top,
+                        right - left,
+                        bottom - top
+                    )
+
+                val template =
+                    buildTrackerTemplate(templateBitmap)
+
+                if (template.xs.isEmpty()) {
+                    throw IllegalStateException(
+                        "Не удалось создать шаблон watermark"
+                    )
+                }
+
+                val tracked =
+                    mutableListOf<MaskKeyframe>()
+
+                val stepMs =
+                    when {
+                        videoDurationMs <= 15_000L -> 400L
+                        videoDurationMs <= 30_000L -> 600L
+                        else -> 1000L
+                    }
+
+                var timeMs = 0L
+
+                while (timeMs <= videoDurationMs) {
+                    val frame =
+                        retriever.getFrameAtTime(
+                            timeMs * 1000L,
+                            MediaMetadataRetriever.OPTION_CLOSEST
+                        )
+
+                    if (frame != null) {
+                        val frameHeight =
+                            maxOf(
+                                1,
+                                (
+                                    frame.height *
+                                    trackingWidth.toFloat() /
+                                    frame.width.toFloat()
+                                ).toInt()
+                            )
+
+                        val scaled =
+                            Bitmap.createScaledBitmap(
+                                frame,
+                                trackingWidth,
+                                frameHeight,
+                                true
+                            )
+
+                        val result =
+                            findWatermarkOnFrame(
+                                scaled,
+                                template
+                            )
+
+                        val found = result.first
+
+                        val rect =
+                            RectF(
+                                found.left.toFloat() /
+                                    scaled.width.toFloat() *
+                                    videoWidth.toFloat(),
+
+                                found.top.toFloat() /
+                                    scaled.height.toFloat() *
+                                    videoHeight.toFloat(),
+
+                                found.right.toFloat() /
+                                    scaled.width.toFloat() *
+                                    videoWidth.toFloat(),
+
+                                found.bottom.toFloat() /
+                                    scaled.height.toFloat() *
+                                    videoHeight.toFloat()
+                            )
+
+                        tracked.add(
+                            MaskKeyframe(
+                                timeMs,
+                                rect
+                            )
+                        )
+                    }
+
+                    val percent =
+                        (
+                            timeMs.toFloat() /
+                            videoDurationMs.toFloat() *
+                            100f
+                        ).toInt().coerceIn(0, 100)
+
+                    runOnUiThread {
+                        binding.tvStatus.text =
+                            "Автотрекинг: $percent%"
+                    }
+
+                    timeMs += stepMs
+                }
+
+                if (tracked.isEmpty()) {
+                    throw IllegalStateException(
+                        "Watermark не найден"
+                    )
+                }
+
+                // Последняя точка до самого конца ролика.
+                if (tracked.last().timeMs < videoDurationMs) {
+                    tracked.add(
+                        MaskKeyframe(
+                            videoDurationMs,
+                            RectF(tracked.last().rect)
+                        )
+                    )
+                }
+
+                runOnUiThread {
+                    keyframes.clear()
+                    keyframes.addAll(tracked)
+
+                    updateKeyframeLabel()
+
+                    binding.tvStatus.text =
+                        "Автотрекинг готов: ${tracked.size} точек"
+
+                    Toast.makeText(
+                        this,
+                        "Плавающий watermark отслежен автоматически",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    binding.tvStatus.text =
+                        "Ошибка автотрекинга: ${e.message}"
+
+                    Toast.makeText(
+                        this,
+                        "Автотрекинг: ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } finally {
+                try {
+                    retriever.release()
+                } catch (_: Throwable) {
+                }
+
+                runOnUiThread {
+                    binding.btnAutoTrack.isEnabled = true
+                }
+            }
+        }.start()
+    }
+
     private fun onAddKeyframe() {
         val rect = currentMaskInVideoCoords()
         if (rect == null) {
@@ -290,8 +818,15 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun onProcessingSuccess(outputPath: String) {
+        val deleteInternal =
+            binding.cbDeleteInternal.isChecked
+
         Thread {
-            val saved = saveToPublicVideos(outputPath)
+            val saved =
+                saveToPublicVideos(
+                    outputPath,
+                    deleteInternal
+                )
 
             runOnUiThread {
                 binding.btnApply.isEnabled = true
@@ -315,7 +850,7 @@ class EditorActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun saveToPublicVideos(outputPath: String): Boolean {
+    private fun saveToPublicVideos(outputPath: String, deleteInternal: Boolean): Boolean {
         val source = File(outputPath)
 
         if (!source.exists() || source.length() == 0L) {
@@ -387,6 +922,10 @@ class EditorActivity : AppCompatActivity() {
                 // исходный обработанный файл НЕ удаляем.
                 // Остаётся и оригинальная копия приложения,
                 // и копия в системном разделе Видео.
+
+                if (deleteInternal) {
+                    source.delete()
+                }
 
                 true
             } catch (e: Exception) {
