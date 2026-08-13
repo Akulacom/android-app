@@ -65,7 +65,7 @@ class EditorActivity : AppCompatActivity() {
             Toast.makeText(this, "Точки трекинга сброшены", Toast.LENGTH_SHORT).show()
         }
 
-        binding.btnApply.setOnClickListener { onApplyClicked() }
+        binding.btnApply.setOnClickListener { try { binding.videoView.pause(); onApplyClicked() } catch (t: Throwable) { binding.btnApply.isEnabled = true; binding.progressBar.visibility = android.view.View.INVISIBLE; val msg = "Ошибка запуска: ${t.javaClass.simpleName}: ${t.message}"; binding.tvStatus.text = msg; Toast.makeText(this, msg, Toast.LENGTH_LONG).show() } }
     }
 
     private fun startSeekBarSync() {
