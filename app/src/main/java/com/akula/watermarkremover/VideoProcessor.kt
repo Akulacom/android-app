@@ -49,7 +49,16 @@ object VideoProcessor {
                 if (ReturnCode.isSuccess(session.returnCode)) {
                     callback.onSuccess(outputPath)
                 } else {
-                    callback.onError("FFmpeg завершился с ошибкой: ${session.returnCode}")
+                    val fullLog = session.allLogsAsString ?: ""
+                    val logTail = if (fullLog.length > 3500) {
+                        fullLog.takeLast(3500)
+                    } else {
+                        fullLog
+                    }
+
+                    callback.onError(
+                        "FFmpeg code: ${session.returnCode}\n\n$logTail"
+                    )
                 }
             },
             null
