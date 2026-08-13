@@ -1,4 +1,7 @@
 package com.akula.watermarkremover
+import android.provider.MediaStore
+import android.os.Build
+import android.content.ContentValues
 
 import android.graphics.RectF
 import android.media.MediaMetadataRetriever
@@ -287,10 +290,111 @@ class EditorActivity : AppCompatActivity() {
     }
 
     private fun onProcessingSuccess(outputPath: String) {
-        runOnUiThread {
-            binding.btnApply.isEnabled = true
-            binding.tvStatus.text = "Готово: $outputPath"
-            Toast.makeText(this, "Сохранено в 1080p:\n$outputPath", Toast.LENGTH_LONG).show()
+        Thread {
+            val saved = saveToPublicVideos(outputPath)
+
+            runOnUiThread {
+                binding.btnApply.isEnabled = true
+
+                if (saved) {
+                    binding.tvStatus.text = "Готово — сохранено в Видео"
+                    Toast.makeText(
+                        this,
+                        "Готовое видео добавлено в раздел Видео",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    binding.tvStatus.text = "Готово, но не удалось добавить в галерею"
+                    Toast.makeText(
+                        this,
+                        "Основной файл сохранён, но копия в Видео не создана",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun saveToPublicVideos(outputPath: String): Boolean {
+        val source = File(outputPath)
+
+        if (!source.exists() || source.length() == 0L) {
+            return false
+        }
+
+        return try {
+            val fileName =
+                "watermark_removed_${System.currentTimeMillis()}.mp4"
+
+            val values = ContentValues().apply {
+                put(
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    fileName
+                )
+                put(
+                    MediaStore.Video.Media.MIME_TYPE,
+                    "video/mp4"
+                )
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(
+                        MediaStore.Video.Media.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_MOVIES}/WatermarkRemover"
+                    )
+                    put(
+                        MediaStore.Video.Media.IS_PENDING,
+                        1
+                    )
+                }
+            }
+
+            val collection =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    MediaStore.Video.Media.getContentUri(
+                        MediaStore.VOLUME_EXTERNAL_PRIMARY
+                    )
+                } else {
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                }
+
+            val uri =
+                contentResolver.insert(collection, values)
+                    ?: return false
+
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    source.inputStream().use { input ->
+                        input.copyTo(output)
+                    }
+                } ?: throw IllegalStateException(
+                    "Не удалось открыть файл назначения"
+                )
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val finished = ContentValues().apply {
+                        put(MediaStore.Video.Media.IS_PENDING, 0)
+                    }
+
+                    contentResolver.update(
+                        uri,
+                        finished,
+                        null,
+                        null
+                    )
+                }
+
+                // ВАЖНО:
+                // исходный обработанный файл НЕ удаляем.
+                // Остаётся и оригинальная копия приложения,
+                // и копия в системном разделе Видео.
+
+                true
+            } catch (e: Exception) {
+                contentResolver.delete(uri, null, null)
+                false
+            }
+        } catch (e: Exception) {
+            false
         }
     }
 
