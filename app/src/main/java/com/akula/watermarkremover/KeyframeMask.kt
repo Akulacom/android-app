@@ -96,7 +96,7 @@ object MaskTracker {
                     "delogo=x=${r.left.toInt().coerceAtLeast(0)}:" +
                         "y=${r.top.toInt().coerceAtLeast(0)}:" +
                         "w=${r.width().toInt().coerceAtLeast(2)}:" +
-                        "h=${r.height().toInt().coerceAtLeast(2)}:band=1:show=0"
+                        "h=${r.height().toInt().coerceAtLeast(2)}:show=0"
                 )
                 continue
             }
@@ -119,7 +119,7 @@ object MaskTracker {
                 val t1s = t1 / 1000.0
 
                 filters.add(
-                    "delogo=x=$x:y=$y:w=$w:h=$h:band=1:show=0:" +
+                    "delogo=x=$x:y=$y:w=$w:h=$h:show=0:" +
                         "enable='between(t,$t0s,$t1s)'"
                 )
             }
