@@ -32,45 +32,70 @@ object VideoProcessor {
         videoHeight: Int,
         callback: Callback
     ) {
-        if (videoWidth < 2 || videoHeight < 2) {
+        if (videoWidth < 6 || videoHeight < 6) {
             callback.onError("Некорректный размер видео: ${videoWidth}x${videoHeight}")
             return
         }
 
         val frameWidth = videoWidth.toFloat()
         val frameHeight = videoHeight.toFloat()
+        val maxRight = frameWidth - 1f
+        val maxBottom = frameHeight - 1f
 
+        /*
+         * delogo внутри использует пограничные пиксели вокруг области.
+         * Поэтому маску нельзя ставить ровно на внешний край кадра.
+         *
+         * Дополнительно слегка расширяем область. Автотрекер часто находит
+         * именно буквы полупрозрачного watermark, а delogo должен получать
+         * немного чистого фона вокруг надписи, иначе часть текста остаётся.
+         */
         val safeKeyframes = keyframes.map { keyframe ->
-            if (!keyframe.active) {
-                keyframe
+            if (!keyframe.active || keyframe.rect.width() < 2f || keyframe.rect.height() < 2f) {
+                keyframe.copy(
+                    rect = RectF(),
+                    active = false,
+                    confidence = 0f
+                )
             } else {
-                val left = keyframe.rect.left.coerceIn(0f, frameWidth)
-                val top = keyframe.rect.top.coerceIn(0f, frameHeight)
-                val right = keyframe.rect.right.coerceIn(0f, frameWidth)
-                val bottom = keyframe.rect.bottom.coerceIn(0f, frameHeight)
-                val clipped = RectF(left, top, right, bottom)
+                val extraX = maxOf(3f, keyframe.rect.width() * 0.22f)
+                val extraY = maxOf(3f, keyframe.rect.height() * 0.30f)
 
-                if (clipped.width() < 2f || clipped.height() < 2f) {
+                val left = (keyframe.rect.left - extraX).coerceAtLeast(1f)
+                val top = (keyframe.rect.top - extraY).coerceAtLeast(1f)
+                val right = (keyframe.rect.right + extraX).coerceAtMost(maxRight)
+                val bottom = (keyframe.rect.bottom + extraY).coerceAtMost(maxBottom)
+
+                if (right - left < 2f || bottom - top < 2f) {
                     keyframe.copy(
-                        rect = RectF(0f, 0f, 0f, 0f),
+                        rect = RectF(),
                         active = false,
                         confidence = 0f
                     )
                 } else {
                     keyframe.copy(
-                        rect = RectF(
-                            clipped.left + 1f,
-                            clipped.top + 1f,
-                            clipped.right + 1f,
-                            clipped.bottom + 1f
-                        )
+                        rect = RectF(left, top, right, bottom)
                     )
                 }
             }
         }
 
+        if (safeKeyframes.none { it.active && it.rect.width() >= 2f && it.rect.height() >= 2f }) {
+            callback.onError("Не найдено ни одной рабочей области watermark для удаления")
+            return
+        }
+
         val delogoChain = MaskTracker.buildTrackedDelogoFilter(safeKeyframes, durationMs)
-        val filter = "pad=iw+2:ih+2:1:1,$delogoChain,crop=iw-2:ih-2:1:1,scale=-2:1080"
+        if (delogoChain == "null" || delogoChain.isBlank()) {
+            callback.onError("FFmpeg не получил ни одной активной маски watermark")
+            return
+        }
+
+        // Важно: delogo снова применяется прямо к исходному кадру.
+        // Предыдущий pad/crop-обход больше не нужен: границы масок уже
+        // безопасно ограничены выше, поэтому результат не превращается
+        // в фактически неизменённое видео.
+        val filter = "$delogoChain,scale=-2:1080"
 
         val cmd = arrayOf(
             "-y",
