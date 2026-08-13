@@ -5,6 +5,7 @@ import android.provider.MediaStore
 import android.os.Build
 import android.content.ContentValues
 
+import android.graphics.Rect
 import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
