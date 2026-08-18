@@ -1,0 +1,112 @@
+name: Final watermark quality patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/final-quality-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch quality fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # 1) Seamless clone: no time holes + feathered edges.
+          p = Path('app/src/main/java/com/akula/watermarkremover/SeamlessCloneProcessor.kt')
+          s = p.read_text()
+          s = s.replace(
+              'val stepMs = 350L',
+              'val stepMs = maxOf(350L, (totalMs + 71L) / 72L)'
+          )
+          s = s.replace(
+              '''return if (result.size <= 72) result else {\n            val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)\n            result.filterIndexed { index, _ -> index % stride == 0 }.take(72)\n        }''',
+              '''if (result.size <= 72) return result\n\n        val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)\n        val kept = result.filterIndexed { index, _ -> index % stride == 0 }.toMutableList()\n        for (i in 0 until kept.size - 1) {\n            kept[i].endMs = kept[i + 1].startMs\n        }\n        kept.lastOrNull()?.endMs = totalMs\n        return kept'''
+          )
+          s = s.replace(
+              'val px = max(2f, rect.width() * 0.025f)\n        val py = max(2f, rect.height() * 0.05f)',
+              'val px = max(3f, rect.width() * 0.04f)\n        val py = max(3f, rect.height() * 0.07f)'
+          )
+
+          start = s.index('    private fun buildFilter(ops: List<Op>): String {')
+          end = s.index('    private fun sec(ms: Long): String', start)
+          new_filter = r'''    /**
+     * Clone-fill с мягким alpha-feather. Донор остаётся из того же кадра,
+     * но его края плавно растворяются в исходном фоне вместо жёсткого прямоугольника.
+     */
+    private fun buildFilter(ops: List<Op>): String {
+        val sb = StringBuilder()
+        sb.append("[0:v]split=${ops.size + 1}[base0]")
+        for (i in ops.indices) sb.append("[donor$i]")
+        sb.append(";")
+
+        for ((i, op) in ops.withIndex()) {
+            val w = op.dst.width().toInt().coerceAtLeast(4)
+            val h = op.dst.height().toInt().coerceAtLeast(4)
+            val sx = op.src.left.toInt().coerceAtLeast(0)
+            val sy = op.src.top.toInt().coerceAtLeast(0)
+            val dx = op.dst.left.toInt().coerceAtLeast(0)
+            val dy = op.dst.top.toInt().coerceAtLeast(0)
+            val feather = max(3, min(18, min(w, h) / 5))
+
+            sb.append("[donor$i]crop=$w:$h:$sx:$sy,format=yuva444p,")
+            sb.append("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':")
+            sb.append("a='255*max(0,min(1,min(min(X/$feather,(W-1-X)/$feather),min(Y/$feather,(H-1-Y)/$feather))))'")
+            sb.append("[patch$i];")
+
+            val baseIn = "[base$i]"
+            val baseOut = if (i == ops.lastIndex) "[merged]" else "[base${i + 1}]"
+            sb.append(baseIn)
+            sb.append("[patch$i]overlay=x=$dx:y=$dy:shortest=1:format=auto:enable='between(t,${sec(op.startMs)},${sec(op.endMs)})'")
+            sb.append(baseOut)
+            sb.append(";")
+        }
+
+        sb.append("[merged]scale=-2:1080[vout]")
+        return sb.toString()
+    }
+
+'''
+          s = s[:start] + new_filter + s[end:]
+          p.write_text(s)
+
+          # 2) If seamless fails at runtime, return a usable result through existing delogo fallback.
+          p = Path('app/src/main/java/com/akula/watermarkremover/VideoProcessor.kt')
+          s = p.read_text()
+          old = '''                        override fun onError(message: String) {\n                            callback.onError(message)\n                        }'''
+          new = '''                        override fun onError(message: String) {\n                            try { File(outputPath).delete() } catch (_: Throwable) {}\n                            executeLegacyFallback(\n                                inputPath = inputPath,\n                                outputPath = outputPath,\n                                durationMs = durationMs,\n                                keyframes = processingKeyframes,\n                                callback = callback,\n                                primaryLog = message\n                            )\n                        }'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # 3) Smaller APK for the actual phone ABIs.
+          p = Path('app/build.gradle.kts')
+          s = p.read_text()
+          if 'abiFilters +=' not in s:
+              s = s.replace(
+                  'versionName = "1.0"',
+                  'versionName = "1.0"\n\n        ndk {\n            abiFilters += listOf("arm64-v8a", "armeabi-v7a")\n        }'
+              )
+          p.write_text(s)
+
+          # 4) FFmpeg 8 compatibility in neural mode if old vsync syntax is present.
+          p = Path('app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt')
+          s = p.read_text()
+          s = s.replace('"-vsync", "0"', '"-fps_mode", "passthrough"')
+          p.write_text(s)
+          PY
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/build.gradle.kts app/src/main/java/com/akula/watermarkremover/SeamlessCloneProcessor.kt app/src/main/java/com/akula/watermarkremover/VideoProcessor.kt app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt
+          git diff --cached --quiet && exit 0
+          git commit -m 'Improve watermark clone blending and coverage'
+          git push origin main
