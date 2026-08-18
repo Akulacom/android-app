@@ -1,15 +1,16 @@
 name: Activate Seamless Clone
 
 on:
-  push:
-    paths:
-      - '.github/workflows/activate-seamless-clone.yml'
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
+  issues: read
 
 jobs:
   patch:
+    if: contains(github.event.comment.body || '', 'RUN_SEAMLESS_CLONE_PATCH')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
