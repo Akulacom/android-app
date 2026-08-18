@@ -1,6 +1,9 @@
 package com.akula.watermarkremover
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import com.arthenica.ffmpegkit.FFmpegKit
@@ -12,14 +15,16 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
- * Быстрый режим удаления watermark через FFmpeg delogo.
+ * Быстрый режим удаления watermark.
  *
- * Перед FFmpeg обработчик повторно проверяет исходное видео через OCR, но этот
- * этап ограничен по времени и показывает прогресс. Если OCR не отвечает на
- * отдельном кадре, такой кадр пропускается вместо бесконечного ожидания.
+ * Основной путь теперь использует FFmpeg removelogo по временным маскам. В отличие
+ * от прямоугольного delogo этот фильтр использует окружающие незамаскированные
+ * пиксели как источник восстановления и обычно оставляет заметно меньше полос.
+ * Старый delogo сохранён только как аварийный fallback.
  */
 object VideoProcessor {
 
@@ -41,6 +46,12 @@ object VideoProcessor {
         val hits: MutableList<TextHit> = mutableListOf()
     )
 
+    private data class LogoRun(
+        var startMs: Long,
+        var endMs: Long,
+        val rect: RectF
+    )
+
     fun removeWatermarkAndExport(
         inputPath: String,
         outputPath: String,
@@ -52,8 +63,6 @@ object VideoProcessor {
             try {
                 callback.onProgress(1)
 
-                // UI keyframes остаются fallback. Сначала пытаемся получить более
-                // надёжный OCR-трек непосредственно из файла, который уйдёт в FFmpeg.
                 val verified = detectRepeatedTextWatermark(
                     inputPath = inputPath,
                     durationMs = durationMs,
@@ -68,64 +77,344 @@ object VideoProcessor {
                     return@Thread
                 }
 
-                val delogoChain = MaskTracker.buildTrackedDelogoFilter(
-                    processingKeyframes,
-                    durationMs
-                )
-
-                if (delogoChain.isBlank() || delogoChain == "null") {
-                    callback.onError("FFmpeg не получил активную область watermark")
+                val videoSize = readVideoSize(inputPath)
+                if (videoSize == null) {
+                    callback.onError("Не удалось определить размер видео")
                     return@Thread
                 }
 
-                callback.onProgress(40)
-
-                val filter = "$delogoChain,scale=-2:1080"
-
-                val cmd = arrayOf(
-                    "-y",
-                    "-i", inputPath,
-                    "-vf", filter,
-                    "-c:v", "libx264",
-                    "-preset", "medium",
-                    "-crf", "20",
-                    "-c:a", "copy",
-                    outputPath
+                val runs = buildLogoRuns(
+                    keyframes = processingKeyframes,
+                    durationMs = durationMs,
+                    videoWidth = videoSize.first,
+                    videoHeight = videoSize.second
                 )
 
-                FFmpegKit.executeWithArgumentsAsync(
-                    cmd,
-                    { session: FFmpegSession ->
-                        if (ReturnCode.isSuccess(session.returnCode)) {
-                            val output = File(outputPath)
-                            if (output.exists() && output.length() > 0L) {
-                                callback.onProgress(100)
-                                callback.onSuccess(outputPath)
-                            } else {
-                                callback.onError("FFmpeg завершился без готового видеофайла")
-                            }
-                        } else {
-                            val fullLog = session.allLogsAsString ?: ""
-                            val tail = fullLog.lines().takeLast(20).joinToString("\n")
-                            callback.onError(
-                                "FFmpeg code: ${session.returnCode}\n\n$tail"
-                            )
-                        }
-                    },
-                    null
-                ) { stats: Statistics ->
-                    if (durationMs > 0) {
-                        val ffmpegPercent = ((stats.time.toFloat() / durationMs.toFloat()) * 100f)
-                            .toInt()
-                            .coerceIn(0, 100)
-                        val totalPercent = 40 + (ffmpegPercent * 60 / 100)
-                        callback.onProgress(totalPercent.coerceIn(40, 99))
-                    }
+                if (runs.isEmpty()) {
+                    callback.onError("Не удалось построить маску watermark")
+                    return@Thread
                 }
+
+                callback.onProgress(38)
+
+                val maskDir = File(
+                    File(outputPath).parentFile ?: File(inputPath).parentFile,
+                    "wm_masks_${System.nanoTime()}"
+                )
+                maskDir.mkdirs()
+
+                val maskFiles = ArrayList<File>()
+                val filterParts = ArrayList<String>()
+                filterParts.add("format=yuv420p")
+
+                for ((index, run) in runs.withIndex()) {
+                    val maskFile = File(maskDir, "mask_$index.png")
+                    createMaskPng(
+                        file = maskFile,
+                        width = videoSize.first,
+                        height = videoSize.second,
+                        rect = run.rect
+                    )
+                    maskFiles.add(maskFile)
+
+                    val start = seconds(run.startMs)
+                    val end = seconds(run.endMs)
+                    val path = escapeFilterPath(maskFile.absolutePath)
+                    filterParts.add(
+                        "removelogo=filename=$path:enable='between(t,$start,$end)'"
+                    )
+                }
+
+                filterParts.add("scale=-2:1080")
+                val removelogoFilter = filterParts.joinToString(",")
+
+                executePrimaryRemoval(
+                    inputPath = inputPath,
+                    outputPath = outputPath,
+                    durationMs = durationMs,
+                    filter = removelogoFilter,
+                    keyframes = processingKeyframes,
+                    callback = callback,
+                    cleanup = {
+                        for (file in maskFiles) {
+                            try { file.delete() } catch (_: Throwable) {}
+                        }
+                        try { maskDir.delete() } catch (_: Throwable) {}
+                    }
+                )
             } catch (t: Throwable) {
                 callback.onError("Обработка: ${t.javaClass.simpleName}: ${t.message}")
             }
         }.start()
+    }
+
+    private fun executePrimaryRemoval(
+        inputPath: String,
+        outputPath: String,
+        durationMs: Long,
+        filter: String,
+        keyframes: List<MaskKeyframe>,
+        callback: Callback,
+        cleanup: () -> Unit
+    ) {
+        val cmd = buildFfmpegCommand(inputPath, outputPath, filter)
+
+        FFmpegKit.executeWithArgumentsAsync(
+            cmd,
+            { session: FFmpegSession ->
+                if (ReturnCode.isSuccess(session.returnCode)) {
+                    cleanup()
+                    finishSuccess(outputPath, callback)
+                } else {
+                    // На редких сборках removelogo может быть отсутствующим или не принять
+                    // конкретную маску. Тогда не оставляем пользователя без результата:
+                    // один раз запускаем проверенный delogo fallback.
+                    try { File(outputPath).delete() } catch (_: Throwable) {}
+                    cleanup()
+                    executeLegacyFallback(
+                        inputPath = inputPath,
+                        outputPath = outputPath,
+                        durationMs = durationMs,
+                        keyframes = keyframes,
+                        callback = callback,
+                        primaryLog = session.allLogsAsString ?: ""
+                    )
+                }
+            },
+            null
+        ) { stats: Statistics ->
+            if (durationMs > 0) {
+                val ffmpegPercent = ((stats.time.toFloat() / durationMs.toFloat()) * 100f)
+                    .toInt()
+                    .coerceIn(0, 100)
+                val totalPercent = 40 + (ffmpegPercent * 60 / 100)
+                callback.onProgress(totalPercent.coerceIn(40, 99))
+            }
+        }
+    }
+
+    private fun executeLegacyFallback(
+        inputPath: String,
+        outputPath: String,
+        durationMs: Long,
+        keyframes: List<MaskKeyframe>,
+        callback: Callback,
+        primaryLog: String
+    ) {
+        val delogoChain = MaskTracker.buildTrackedDelogoFilter(keyframes, durationMs)
+        if (delogoChain.isBlank() || delogoChain == "null") {
+            callback.onError("removelogo не запустился, а fallback не получил маску")
+            return
+        }
+
+        val filter = "$delogoChain,scale=-2:1080"
+        val cmd = buildFfmpegCommand(inputPath, outputPath, filter)
+
+        FFmpegKit.executeWithArgumentsAsync(
+            cmd,
+            { session: FFmpegSession ->
+                if (ReturnCode.isSuccess(session.returnCode)) {
+                    finishSuccess(outputPath, callback)
+                } else {
+                    val secondaryLog = session.allLogsAsString ?: ""
+                    val combined = (primaryLog + "\n" + secondaryLog)
+                        .lines()
+                        .takeLast(24)
+                        .joinToString("\n")
+                    callback.onError(
+                        "Оба способа удаления завершились ошибкой.\n\n$combined"
+                    )
+                }
+            },
+            null
+        ) { stats: Statistics ->
+            if (durationMs > 0) {
+                val ffmpegPercent = ((stats.time.toFloat() / durationMs.toFloat()) * 100f)
+                    .toInt()
+                    .coerceIn(0, 100)
+                val totalPercent = 40 + (ffmpegPercent * 60 / 100)
+                callback.onProgress(totalPercent.coerceIn(40, 99))
+            }
+        }
+    }
+
+    private fun buildFfmpegCommand(
+        inputPath: String,
+        outputPath: String,
+        filter: String
+    ): Array<String> {
+        return arrayOf(
+            "-y",
+            "-i", inputPath,
+            "-vf", filter,
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-c:a", "copy",
+            outputPath
+        )
+    }
+
+    private fun finishSuccess(outputPath: String, callback: Callback) {
+        val output = File(outputPath)
+        if (output.exists() && output.length() > 0L) {
+            callback.onProgress(100)
+            callback.onSuccess(outputPath)
+        } else {
+            callback.onError("FFmpeg завершился без готового видеофайла")
+        }
+    }
+
+    private fun readVideoSize(inputPath: String): Pair<Int, Int>? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(inputPath)
+            val frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?: return null
+            try {
+                frame.width to frame.height
+            } finally {
+                frame.recycle()
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { retriever.release() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun buildLogoRuns(
+        keyframes: List<MaskKeyframe>,
+        durationMs: Long,
+        videoWidth: Int,
+        videoHeight: Int
+    ): List<LogoRun> {
+        val sorted = keyframes.sortedBy { it.timeMs }
+        if (sorted.isEmpty()) return emptyList()
+
+        val totalMs = durationMs.coerceAtLeast(1L)
+        val stepMs = 250L
+        val runs = ArrayList<LogoRun>()
+        var current: LogoRun? = null
+        var t0 = 0L
+
+        while (t0 < totalMs) {
+            val t1 = (t0 + stepMs).coerceAtMost(totalMs)
+            val mid = (t0 + t1) / 2L
+            val state = nearestKeyframe(sorted, mid)
+
+            if (state.active && state.rect.width() >= 2f && state.rect.height() >= 2f) {
+                val expanded = expandRepairRect(
+                    state.rect,
+                    videoWidth,
+                    videoHeight
+                )
+
+                if (current != null &&
+                    current.endMs == t0 &&
+                    nearlySameRect(current.rect, expanded)
+                ) {
+                    current.endMs = t1
+                } else {
+                    current = LogoRun(t0, t1, expanded)
+                    runs.add(current)
+                }
+            } else {
+                current = null
+            }
+
+            t0 = t1
+        }
+
+        return runs
+    }
+
+    private fun nearestKeyframe(
+        sorted: List<MaskKeyframe>,
+        timeMs: Long
+    ): MaskKeyframe {
+        if (sorted.size == 1) return sorted[0]
+        if (timeMs <= sorted.first().timeMs) return sorted.first()
+        if (timeMs >= sorted.last().timeMs) return sorted.last()
+
+        var best = sorted.first()
+        var distance = kotlin.math.abs(best.timeMs - timeMs)
+        for (item in sorted) {
+            val d = kotlin.math.abs(item.timeMs - timeMs)
+            if (d < distance) {
+                best = item
+                distance = d
+            }
+        }
+        return best
+    }
+
+    private fun expandRepairRect(
+        source: RectF,
+        videoWidth: Int,
+        videoHeight: Int
+    ): RectF {
+        // OCR обычно ограничивает рамку самими видимыми буквами, а у прозрачного
+        // watermark остаётся полупрозрачный ореол. Дополнительный запас закрывает
+        // этот ореол, но остаётся умеренным, чтобы не портить фон вокруг.
+        val padX = maxOf(7f, source.width() * 0.18f)
+        val padY = maxOf(5f, source.height() * 0.30f)
+        val margin = 2f
+
+        return RectF(
+            (source.left - padX).coerceIn(margin, videoWidth.toFloat() - margin - 2f),
+            (source.top - padY).coerceIn(margin, videoHeight.toFloat() - margin - 2f),
+            (source.right + padX).coerceIn(margin + 2f, videoWidth.toFloat() - margin),
+            (source.bottom + padY).coerceIn(margin + 2f, videoHeight.toFloat() - margin)
+        )
+    }
+
+    private fun nearlySameRect(a: RectF, b: RectF): Boolean {
+        val tolerance = 6f
+        return kotlin.math.abs(a.left - b.left) <= tolerance &&
+            kotlin.math.abs(a.top - b.top) <= tolerance &&
+            kotlin.math.abs(a.right - b.right) <= tolerance &&
+            kotlin.math.abs(a.bottom - b.bottom) <= tolerance
+    }
+
+    private fun createMaskPng(
+        file: File,
+        width: Int,
+        height: Int,
+        rect: RectF
+    ) {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        try {
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(Color.BLACK)
+
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+
+            val radius = minOf(rect.width(), rect.height()) * 0.28f
+            canvas.drawRoundRect(rect, radius, radius, paint)
+
+            file.outputStream().use { output ->
+                if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                    throw IllegalStateException("Не удалось создать mask PNG")
+                }
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun escapeFilterPath(path: String): String {
+        return path
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'")
+    }
+
+    private fun seconds(timeMs: Long): String {
+        return String.format(Locale.US, "%.3f", timeMs / 1000.0)
     }
 
     /**
@@ -155,9 +444,6 @@ object VideoProcessor {
 
             if (videoWidth < 16 || videoHeight < 16) return null
 
-            // Раньше здесь было 200 мс: на 30-секундном ролике это означало
-            // примерно 150 тяжёлых OCR-запросов после уже выполненного автопоиска.
-            // 450-1000 мс достаточно для прыгающего watermark и намного быстрее.
             val stepMs = when {
                 durationMs <= 30_000L -> 450L
                 durationMs <= 90_000L -> 700L
@@ -206,7 +492,6 @@ object VideoProcessor {
                 }
 
                 try {
-                    // Ни один зависший ML Kit запрос больше не может повесить весь экспорт.
                     val result = try {
                         Tasks.await(
                             recognizer.process(InputImage.fromBitmap(ocrFrame, 0)),
@@ -336,9 +621,6 @@ object VideoProcessor {
             }.sortedByDescending { it.score }
 
             val best = ranked.firstOrNull() ?: return null
-
-            // Если OCR нашёл Dola/Doubao/Seedance, такой брендовый сигнал должен
-            // выигрывать у текста на футболке даже при меньшем числе распознаваний.
             val known = ranked.firstOrNull { knownWatermarkBonus(it.group.key) > 0f }
             val chosen = if (known != null && known.score >= best.score * 0.55f) known else best
 
