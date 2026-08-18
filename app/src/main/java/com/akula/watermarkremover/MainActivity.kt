@@ -21,6 +21,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val pickPhoto = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val intent = Intent(this, PhotoEditorActivity::class.java)
+            intent.putExtra(PhotoEditorActivity.EXTRA_IMAGE_URI, uri.toString())
+            startActivity(intent)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
@@ -28,6 +38,10 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnAddVideo.setOnClickListener {
             pickVideo.launch("video/*")
+        }
+
+        binding.btnAddPhoto.setOnClickListener {
+            pickPhoto.launch("image/*")
         }
     }
 }
