@@ -83,6 +83,33 @@ object VideoProcessor {
                     return@Thread
                 }
 
+
+                // Основной быстрый путь без размытого removelogo-пятна.
+                // Берём похожий фон из соседней области того же текущего кадра,
+                // поэтому текстура продолжает двигаться вместе с камерой.
+                SeamlessCloneProcessor.process(
+                    inputPath = inputPath,
+                    outputPath = outputPath,
+                    keyframes = processingKeyframes,
+                    durationMs = durationMs,
+                    videoWidth = videoSize.first,
+                    videoHeight = videoSize.second,
+                    callback = object : SeamlessCloneProcessor.Callback {
+                        override fun onProgress(percent: Int) {
+                            callback.onProgress(percent)
+                        }
+
+                        override fun onSuccess(outputPath: String) {
+                            callback.onSuccess(outputPath)
+                        }
+
+                        override fun onError(message: String) {
+                            callback.onError(message)
+                        }
+                    }
+                )
+                return@Thread
+
                 val runs = buildLogoRuns(
                     keyframes = processingKeyframes,
                     durationMs = durationMs,
