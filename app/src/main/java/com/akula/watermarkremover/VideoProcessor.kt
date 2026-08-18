@@ -11,13 +11,15 @@ import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.io.File
+import java.util.concurrent.TimeUnit
 
 /**
  * Быстрый режим удаления watermark через FFmpeg delogo.
  *
- * Важное отличие: перед запуском FFmpeg обработчик сам повторно проверяет
- * исходное видео через OCR. Это не даёт UI-автотрекеру случайно передать
- * десятки масок от текста на одежде, баннерах или других деталях сцены.
+ * Перед FFmpeg обработчик повторно проверяет исходное видео через OCR, но этот
+ * этап ограничен по времени и показывает прогресс. Если OCR не отвечает на
+ * отдельном кадре, такой кадр пропускается вместо бесконечного ожидания.
  */
 object VideoProcessor {
 
@@ -48,9 +50,15 @@ object VideoProcessor {
     ) {
         Thread {
             try {
+                callback.onProgress(1)
+
                 // UI keyframes остаются fallback. Сначала пытаемся получить более
                 // надёжный OCR-трек непосредственно из файла, который уйдёт в FFmpeg.
-                val verified = detectRepeatedTextWatermark(inputPath, durationMs)
+                val verified = detectRepeatedTextWatermark(
+                    inputPath = inputPath,
+                    durationMs = durationMs,
+                    callback = callback
+                )
                 val processingKeyframes = verified ?: keyframes
 
                 if (processingKeyframes.none {
@@ -70,6 +78,8 @@ object VideoProcessor {
                     return@Thread
                 }
 
+                callback.onProgress(40)
+
                 val filter = "$delogoChain,scale=-2:1080"
 
                 val cmd = arrayOf(
@@ -87,7 +97,13 @@ object VideoProcessor {
                     cmd,
                     { session: FFmpegSession ->
                         if (ReturnCode.isSuccess(session.returnCode)) {
-                            callback.onSuccess(outputPath)
+                            val output = File(outputPath)
+                            if (output.exists() && output.length() > 0L) {
+                                callback.onProgress(100)
+                                callback.onSuccess(outputPath)
+                            } else {
+                                callback.onError("FFmpeg завершился без готового видеофайла")
+                            }
                         } else {
                             val fullLog = session.allLogsAsString ?: ""
                             val tail = fullLog.lines().takeLast(20).joinToString("\n")
@@ -99,10 +115,11 @@ object VideoProcessor {
                     null
                 ) { stats: Statistics ->
                     if (durationMs > 0) {
-                        val percent = ((stats.time.toFloat() / durationMs.toFloat()) * 100f)
+                        val ffmpegPercent = ((stats.time.toFloat() / durationMs.toFloat()) * 100f)
                             .toInt()
                             .coerceIn(0, 100)
-                        callback.onProgress(percent)
+                        val totalPercent = 40 + (ffmpegPercent * 60 / 100)
+                        callback.onProgress(totalPercent.coerceIn(40, 99))
                     }
                 }
             } catch (t: Throwable) {
@@ -118,7 +135,8 @@ object VideoProcessor {
      */
     private fun detectRepeatedTextWatermark(
         inputPath: String,
-        durationMs: Long
+        durationMs: Long,
+        callback: Callback
     ): List<MaskKeyframe>? {
         val retriever = MediaMetadataRetriever()
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -137,10 +155,13 @@ object VideoProcessor {
 
             if (videoWidth < 16 || videoHeight < 16) return null
 
+            // Раньше здесь было 200 мс: на 30-секундном ролике это означало
+            // примерно 150 тяжёлых OCR-запросов после уже выполненного автопоиска.
+            // 450-1000 мс достаточно для прыгающего watermark и намного быстрее.
             val stepMs = when {
-                durationMs <= 30_000L -> 200L
-                durationMs <= 90_000L -> 350L
-                else -> 600L
+                durationMs <= 30_000L -> 450L
+                durationMs <= 90_000L -> 700L
+                else -> 1000L
             }
 
             val times = mutableListOf<Long>()
@@ -155,11 +176,17 @@ object VideoProcessor {
 
             val groups = mutableListOf<TextGroup>()
 
-            for (timeMs in times) {
+            for ((index, timeMs) in times.withIndex()) {
                 val frame = retriever.getFrameAtTime(
                     timeMs * 1000L,
                     MediaMetadataRetriever.OPTION_CLOSEST
-                ) ?: continue
+                )
+
+                if (frame == null) {
+                    val verifyProgress = 5 + (((index + 1).toFloat() / times.size.toFloat()) * 30f).toInt()
+                    callback.onProgress(verifyProgress.coerceIn(5, 35))
+                    continue
+                }
 
                 val targetWidth = when {
                     frame.width < 1080 -> minOf(1080, (frame.width * 1.7f).toInt())
@@ -179,48 +206,66 @@ object VideoProcessor {
                 }
 
                 try {
-                    val result = Tasks.await(
-                        recognizer.process(InputImage.fromBitmap(ocrFrame, 0))
-                    )
+                    // Ни один зависший ML Kit запрос больше не может повесить весь экспорт.
+                    val result = try {
+                        Tasks.await(
+                            recognizer.process(InputImage.fromBitmap(ocrFrame, 0)),
+                            4L,
+                            TimeUnit.SECONDS
+                        )
+                    } catch (_: Throwable) {
+                        null
+                    }
 
-                    for (block in result.textBlocks) {
-                        for (line in block.lines) {
-                            val box = line.boundingBox ?: continue
-                            val key = normalizeText(line.text)
-                            if (key.length !in 2..40) continue
-                            if (!isCompactOverlay(box.width(), box.height(), ocrFrame.width, ocrFrame.height)) {
-                                continue
+                    if (result != null) {
+                        for (block in result.textBlocks) {
+                            for (line in block.lines) {
+                                val box = line.boundingBox ?: continue
+                                val key = normalizeText(line.text)
+                                if (key.length !in 2..40) continue
+                                if (!isCompactOverlay(
+                                        box.width(),
+                                        box.height(),
+                                        ocrFrame.width,
+                                        ocrFrame.height
+                                    )
+                                ) {
+                                    continue
+                                }
+
+                                val rect = toSafeVideoRect(
+                                    left = box.left.toFloat(),
+                                    top = box.top.toFloat(),
+                                    right = box.right.toFloat(),
+                                    bottom = box.bottom.toFloat(),
+                                    ocrWidth = ocrFrame.width,
+                                    ocrHeight = ocrFrame.height,
+                                    videoWidth = videoWidth,
+                                    videoHeight = videoHeight
+                                ) ?: continue
+
+                                val hit = TextHit(
+                                    timeMs = timeMs,
+                                    key = key,
+                                    text = line.text,
+                                    rect = rect
+                                )
+
+                                var group = groups.firstOrNull { sameTextKey(it.key, key) }
+                                if (group == null) {
+                                    group = TextGroup(key)
+                                    groups.add(group)
+                                }
+                                group.hits.add(hit)
                             }
-
-                            val rect = toSafeVideoRect(
-                                left = box.left.toFloat(),
-                                top = box.top.toFloat(),
-                                right = box.right.toFloat(),
-                                bottom = box.bottom.toFloat(),
-                                ocrWidth = ocrFrame.width,
-                                ocrHeight = ocrFrame.height,
-                                videoWidth = videoWidth,
-                                videoHeight = videoHeight
-                            ) ?: continue
-
-                            val hit = TextHit(
-                                timeMs = timeMs,
-                                key = key,
-                                text = line.text,
-                                rect = rect
-                            )
-
-                            var group = groups.firstOrNull { sameTextKey(it.key, key) }
-                            if (group == null) {
-                                group = TextGroup(key)
-                                groups.add(group)
-                            }
-                            group.hits.add(hit)
                         }
                     }
                 } finally {
                     if (ocrFrame !== frame) ocrFrame.recycle()
                     frame.recycle()
+
+                    val verifyProgress = 5 + (((index + 1).toFloat() / times.size.toFloat()) * 30f).toInt()
+                    callback.onProgress(verifyProgress.coerceIn(5, 35))
                 }
             }
 
