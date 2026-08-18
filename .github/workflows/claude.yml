@@ -37,6 +37,7 @@ jobs:
         env:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENTROUTER_API_KEY }}
           ANTHROPIC_BASE_URL: https://co.agentrouter.org
+          ANTHROPIC_CUSTOM_HEADERS: 'Authorization: Bearer ${{ secrets.AGENTROUTER_API_KEY }}'
           ANTHROPIC_MODEL: claude-opus-5
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1"
         with:
