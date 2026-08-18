@@ -48,6 +48,7 @@ jobs:
             echo '### APK BUILD FAILURE'
             echo
             echo "Commit: ${{ github.sha }}"
+            echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo '```text'
             tail -120 /tmp/gradle-build.log
             echo '```'
@@ -63,3 +64,15 @@ jobs:
         with:
           name: app-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Report build success to Issue #1
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          BODY="### APK BUILD SUCCESS\n\nCommit: ${{ github.sha }}\nRun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\nArtifact: app-debug-apk"
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/issues/1/comments" \
+            -f body="$BODY"
