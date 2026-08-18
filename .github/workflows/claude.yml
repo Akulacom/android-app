@@ -31,7 +31,7 @@ jobs:
       - name: Install Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code@latest
 
-      - name: AgentRouter preflight and model selection
+      - name: AgentRouter auth preflight and model selection
         id: router
         continue-on-error: true
         env:
@@ -39,14 +39,32 @@ jobs:
         shell: bash
         run: |
           set -u
-          HTTP_CODE=$(curl -sS -o /tmp/models.json -w "%{http_code}" \
+          KEY_LEN=${#AGENTROUTER_API_KEY}
+          echo "key_len=${KEY_LEN}" >> "$GITHUB_OUTPUT"
+          if [ "$KEY_LEN" -eq 0 ]; then
+            echo "GitHub secret AGENTROUTER_API_KEY is empty or missing" > /tmp/router-status.txt
+            exit 1
+          fi
+
+          BEARER_HTTP=$(curl -sS -o /tmp/models-bearer.json -w "%{http_code}" \
             -H "Authorization: Bearer ${AGENTROUTER_API_KEY}" \
             https://co.agentrouter.org/v1/models || true)
-          echo "http=${HTTP_CODE}" >> "$GITHUB_OUTPUT"
-          echo "AgentRouter /v1/models HTTP ${HTTP_CODE}"
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "AgentRouter key/preflight failed with HTTP ${HTTP_CODE}" > /tmp/router-status.txt
+          XAPI_HTTP=$(curl -sS -o /tmp/models-xapi.json -w "%{http_code}" \
+            -H "x-api-key: ${AGENTROUTER_API_KEY}" \
+            https://co.agentrouter.org/v1/models || true)
+
+          echo "bearer_http=${BEARER_HTTP}" >> "$GITHUB_OUTPUT"
+          echo "xapi_http=${XAPI_HTTP}" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEARER_HTTP" = "200" ]; then
+            AUTH_SCHEME="bearer"
+            cp /tmp/models-bearer.json /tmp/models.json
+          elif [ "$XAPI_HTTP" = "200" ]; then
+            AUTH_SCHEME="x-api-key"
+            cp /tmp/models-xapi.json /tmp/models.json
+          else
+            echo "AgentRouter auth failed; secret length=${KEY_LEN}; Bearer HTTP=${BEARER_HTTP}; x-api-key HTTP=${XAPI_HTTP}" > /tmp/router-status.txt
             exit 1
           fi
 
@@ -57,13 +75,14 @@ jobs:
             ([.data[].id | select(startswith("claude-"))][0]) // empty
           ' /tmp/models.json 2>/dev/null || true)
 
-          if [ -z "${MODEL}" ]; then
-            echo "No Claude model found for this key" > /tmp/router-status.txt
+          if [ -z "$MODEL" ]; then
+            echo "AgentRouter authenticated with ${AUTH_SCHEME}, but no Claude model was returned" > /tmp/router-status.txt
             exit 1
           fi
 
+          echo "auth_scheme=${AUTH_SCHEME}" >> "$GITHUB_OUTPUT"
           echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
-          echo "AgentRouter OK; selected model: ${MODEL}" > /tmp/router-status.txt
+          echo "AgentRouter auth OK (${AUTH_SCHEME}); secret length=${KEY_LEN}; selected model=${MODEL}" > /tmp/router-status.txt
 
       - name: Direct Anthropic Messages probe
         id: probe
@@ -72,6 +91,7 @@ jobs:
         env:
           AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
           MODEL: ${{ steps.router.outputs.model }}
+          AUTH_SCHEME: ${{ steps.router.outputs.auth_scheme }}
         shell: bash
         run: |
           set -u
@@ -83,17 +103,23 @@ jobs:
           }
           EOF
 
+          if [ "$AUTH_SCHEME" = "bearer" ]; then
+            AUTH_HEADER="Authorization: Bearer ${AGENTROUTER_API_KEY}"
+          else
+            AUTH_HEADER="x-api-key: ${AGENTROUTER_API_KEY}"
+          fi
+
           HTTP_CODE=$(curl -sS -o /tmp/probe-response.json -w "%{http_code}" \
             -X POST https://co.agentrouter.org/v1/messages \
-            -H "Authorization: Bearer ${AGENTROUTER_API_KEY}" \
+            -H "$AUTH_HEADER" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
             --data-binary @/tmp/request.json || true)
 
           echo "http=${HTTP_CODE}" >> "$GITHUB_OUTPUT"
-          if [ "${HTTP_CODE}" = "200" ]; then
+          if [ "$HTTP_CODE" = "200" ]; then
             TEXT=$(jq -r '.content[0].text // empty' /tmp/probe-response.json 2>/dev/null || true)
-            echo "Direct Messages API OK: ${TEXT}" > /tmp/probe-status.txt
+            echo "Direct Messages API OK (${AUTH_SCHEME}): ${TEXT}" > /tmp/probe-status.txt
           else
             ERROR=$(jq -r '.error.message // .message // "unknown error"' /tmp/probe-response.json 2>/dev/null || true)
             echo "Direct Messages API failed: HTTP ${HTTP_CODE}; ${ERROR}" > /tmp/probe-status.txt
@@ -105,13 +131,21 @@ jobs:
         if: steps.router.outcome == 'success' && steps.probe.outcome == 'success'
         continue-on-error: true
         env:
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENTROUTER_API_KEY }}
+          AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
           ANTHROPIC_BASE_URL: https://co.agentrouter.org
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1"
           MODEL: ${{ steps.router.outputs.model }}
+          AUTH_SCHEME: ${{ steps.router.outputs.auth_scheme }}
         shell: bash
         run: |
           set +e
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+          if [ "$AUTH_SCHEME" = "bearer" ]; then
+            export ANTHROPIC_AUTH_TOKEN="$AGENTROUTER_API_KEY"
+          else
+            export ANTHROPIC_API_KEY="$AGENTROUTER_API_KEY"
+          fi
+
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             PROMPT=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
           else
