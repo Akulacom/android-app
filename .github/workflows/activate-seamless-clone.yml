@@ -3,7 +3,7 @@ name: Activate Seamless Clone
 on:
   push:
     paths:
-      - '.github/seamless-clone-trigger.txt'
+      - '.github/workflows/activate-seamless-clone.yml'
 
 permissions:
   contents: write
