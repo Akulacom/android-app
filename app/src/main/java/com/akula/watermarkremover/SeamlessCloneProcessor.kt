@@ -18,8 +18,7 @@ import kotlin.math.min
  * Быстрый режим без размытого delogo-пятна.
  *
  * Для каждого короткого временного сегмента подбирается похожий участок фона
- * рядом с watermark. Этот участок берётся из ТОГО ЖЕ текущего кадра, поэтому
- * он двигается вместе с камерой. Края клона смешиваются мягкой alpha-маской.
+ * рядом с watermark. Донор берётся из того же текущего кадра.
  */
 object SeamlessCloneProcessor {
 
@@ -91,11 +90,23 @@ object SeamlessCloneProcessor {
                                 callback.onError("FFmpeg завершился без готового файла")
                             }
                         } else {
-                            val tail = (session.allLogsAsString ?: "")
-                                .lines()
-                                .takeLast(30)
+                            val logs = session.allLogsAsString ?: ""
+                            val useful = logs.lines()
+                                .filter { line ->
+                                    line.contains("Error", true) ||
+                                        line.contains("Invalid", true) ||
+                                        line.contains("Failed", true) ||
+                                        line.contains("filter", true) ||
+                                        line.contains("overlay", true) ||
+                                        line.contains("crop", true)
+                                }
+                                .takeLast(24)
                                 .joinToString("\n")
-                            callback.onError("Seamless clone FFmpeg: ${session.returnCode}\n\n$tail")
+                            val fallback = logs.lines().takeLast(40).joinToString("\n")
+                            callback.onError(
+                                "Seamless clone FFmpeg: ${session.returnCode}\n\n" +
+                                    if (useful.isNotBlank()) useful else fallback
+                            )
                         }
                     },
                     null
@@ -122,67 +133,63 @@ object SeamlessCloneProcessor {
         videoWidth: Int,
         videoHeight: Int
     ): List<Op> {
-        if (keyframes.isEmpty()) return emptyList()
+        val track = keyframes.sortedBy { it.timeMs }
+        if (track.isEmpty()) return emptyList()
 
         val totalMs = durationMs.coerceAtLeast(1L)
         val stepMs = 350L
         val result = ArrayList<Op>()
 
-        for ((_, rawTrack) in keyframes.groupBy { it.trackId }) {
-            val track = rawTrack.sortedBy { it.timeMs }
-            if (track.isEmpty()) continue
+        var t0 = 0L
+        var current: Op? = null
+        while (t0 < totalMs) {
+            val t1 = (t0 + stepMs).coerceAtMost(totalMs)
+            val mid = (t0 + t1) / 2L
+            val state = nearest(track, mid)
 
-            var t0 = 0L
-            var current: Op? = null
-            while (t0 < totalMs) {
-                val t1 = (t0 + stepMs).coerceAtMost(totalMs)
-                val mid = (t0 + t1) / 2L
-                val state = nearest(track, mid)
+            if (state.active && state.rect.width() >= 4f && state.rect.height() >= 4f) {
+                val dst = sanitizeAndPad(state.rect, videoWidth, videoHeight)
+                val frame = retriever.getFrameAtTime(
+                    mid * 1000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST
+                )
 
-                if (state.active && state.confidence >= 0.20f &&
-                    state.rect.width() >= 4f && state.rect.height() >= 4f
-                ) {
-                    val dst = sanitizeAndPad(state.rect, videoWidth, videoHeight)
-                    val frame = retriever.getFrameAtTime(
-                        mid * 1000L,
-                        MediaMetadataRetriever.OPTION_CLOSEST
-                    )
-
-                    val src = if (frame != null) {
-                        try {
-                            chooseBestSource(frame, dst, videoWidth, videoHeight)
-                        } finally {
-                            frame.recycle()
-                        }
-                    } else {
-                        fallbackSource(dst, videoWidth, videoHeight)
-                    }
-
-                    if (current != null && current.endMs == t0 &&
-                        closeRect(current.dst, dst, 5f) && closeRect(current.src, src, 8f)
-                    ) {
-                        current.endMs = t1
-                    } else {
-                        current = Op(t0, t1, dst, src)
-                        result.add(current)
+                val src = if (frame != null) {
+                    try {
+                        chooseBestSource(frame, dst, videoWidth, videoHeight)
+                    } finally {
+                        frame.recycle()
                     }
                 } else {
-                    current = null
+                    fallbackSource(dst, videoWidth, videoHeight)
                 }
 
-                t0 = t1
+                if (current != null && current.endMs == t0 &&
+                    closeRect(current.dst, dst, 5f) && closeRect(current.src, src, 8f)
+                ) {
+                    current.endMs = t1
+                } else {
+                    current = Op(t0, t1, dst, src)
+                    result.add(current)
+                }
+            } else {
+                current = null
             }
+
+            t0 = t1
         }
 
-        // Ограничиваем сложность filter_complex на длинных роликах.
-        return if (result.size <= 90) result else {
-            val stride = (result.size / 90.0).toInt().coerceAtLeast(1)
-            result.filterIndexed { index, _ -> index % stride == 0 }.take(90)
+        return if (result.size <= 72) result else {
+            val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)
+            result.filterIndexed { index, _ -> index % stride == 0 }.take(72)
         }
     }
 
     private fun nearest(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
         if (sorted.size == 1) return sorted[0]
+        if (timeMs <= sorted.first().timeMs) return sorted.first()
+        if (timeMs >= sorted.last().timeMs) return sorted.last()
+
         var best = sorted.first()
         var bestD = kotlin.math.abs(best.timeMs - timeMs)
         for (k in sorted) {
@@ -196,8 +203,8 @@ object SeamlessCloneProcessor {
     }
 
     private fun sanitizeAndPad(rect: RectF, w: Int, h: Int): RectF {
-        val px = max(2f, rect.width() * 0.03f)
-        val py = max(2f, rect.height() * 0.06f)
+        val px = max(2f, rect.width() * 0.025f)
+        val py = max(2f, rect.height() * 0.05f)
         val l = (rect.left - px).coerceIn(1f, w.toFloat() - 3f)
         val t = (rect.top - py).coerceIn(1f, h.toFloat() - 3f)
         val r = (rect.right + px).coerceIn(l + 2f, w.toFloat() - 1f)
@@ -215,7 +222,7 @@ object SeamlessCloneProcessor {
         val h = dst.height().toInt().coerceAtLeast(4)
         val dx = dst.left.toInt()
         val dy = dst.top.toInt()
-        val gap = max(8, min(w, h) / 5)
+        val gap = max(6, min(w, h) / 6)
 
         val candidates = ArrayList<RectF>()
         val offsets = listOf(
@@ -253,7 +260,7 @@ object SeamlessCloneProcessor {
     private fun borderScore(bitmap: Bitmap, dst: RectF, src: RectF): Double {
         val w = min(dst.width().toInt(), src.width().toInt()).coerceAtLeast(2)
         val h = min(dst.height().toInt(), src.height().toInt()).coerceAtLeast(2)
-        val samples = 18
+        val samples = 20
         var total = 0.0
         var count = 0
 
@@ -268,15 +275,14 @@ object SeamlessCloneProcessor {
         }
 
         for (i in 0 until samples) {
-            val fx = i.toFloat() / (samples - 1).toFloat()
-            val fy = fx
-            val x1 = dst.left.toInt() + (fx * (w - 1)).toInt()
-            val x2 = src.left.toInt() + (fx * (w - 1)).toInt()
+            val f = i.toFloat() / (samples - 1).toFloat()
+            val x1 = dst.left.toInt() + (f * (w - 1)).toInt()
+            val x2 = src.left.toInt() + (f * (w - 1)).toInt()
             diff(x1, dst.top.toInt(), x2, src.top.toInt())
             diff(x1, dst.bottom.toInt() - 1, x2, src.bottom.toInt() - 1)
 
-            val y1 = dst.top.toInt() + (fy * (h - 1)).toInt()
-            val y2 = src.top.toInt() + (fy * (h - 1)).toInt()
+            val y1 = dst.top.toInt() + (f * (h - 1)).toInt()
+            val y2 = src.top.toInt() + (f * (h - 1)).toInt()
             diff(dst.left.toInt(), y1, src.left.toInt(), y2)
             diff(dst.right.toInt() - 1, y1, src.right.toInt() - 1, y2)
         }
@@ -287,7 +293,7 @@ object SeamlessCloneProcessor {
     private fun fallbackSource(dst: RectF, videoWidth: Int, videoHeight: Int): RectF {
         val w = dst.width().toInt().coerceAtLeast(2)
         val h = dst.height().toInt().coerceAtLeast(2)
-        val gap = max(8, min(w, h) / 5)
+        val gap = max(6, min(w, h) / 6)
 
         val rightX = dst.right.toInt() + gap
         if (rightX + w <= videoWidth) {
@@ -313,6 +319,10 @@ object SeamlessCloneProcessor {
             abs(a.right - b.right) <= tolerance && abs(a.bottom - b.bottom) <= tolerance
     }
 
+    /**
+     * Совместимый с мобильным FFmpeg путь: только split/crop/overlay.
+     * Убраны color + alphamerge + boxblur, которые падали на части сборок FFmpegKit.
+     */
     private fun buildFilter(ops: List<Op>): String {
         val sb = StringBuilder()
         sb.append("[0:v]split=${ops.size + 1}[base0]")
@@ -326,21 +336,13 @@ object SeamlessCloneProcessor {
             val sy = op.src.top.toInt().coerceAtLeast(0)
             val dx = op.dst.left.toInt().coerceAtLeast(0)
             val dy = op.dst.top.toInt().coerceAtLeast(0)
-            val feather = max(2, min(14, min(w, h) / 6))
-            val innerW = max(1, w - feather * 2)
-            val innerH = max(1, h - feather * 2)
-            val blur = max(1, feather / 2)
 
-            sb.append("[donor$i]crop=$w:$h:$sx:$sy,format=rgba[patchRgb$i];")
-            sb.append("color=c=black:s=${w}x${h}:r=30,format=gray,")
-            sb.append("drawbox=x=$feather:y=$feather:w=$innerW:h=$innerH:color=white:t=fill,")
-            sb.append("boxblur=luma_radius=$blur:luma_power=2[mask$i];")
-            sb.append("[patchRgb$i][mask$i]alphamerge[patch$i];")
+            sb.append("[donor$i]crop=$w:$h:$sx:$sy[patch$i];")
 
             val baseIn = "[base$i]"
             val baseOut = if (i == ops.lastIndex) "[merged]" else "[base${i + 1}]"
             sb.append(baseIn)
-            sb.append("[patch$i]overlay=x=$dx:y=$dy:enable='between(t,${sec(op.startMs)},${sec(op.endMs)})'")
+            sb.append("[patch$i]overlay=x=$dx:y=$dy:shortest=1:enable='between(t,${sec(op.startMs)},${sec(op.endMs)})'")
             sb.append(baseOut)
             sb.append(";")
         }
