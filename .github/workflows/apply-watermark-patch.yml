@@ -1,0 +1,34 @@
+name: Apply Watermark Quality Patch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/patch_video_processor.py'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[wm-patch-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply targeted VideoProcessor patch
+        run: python3 scripts/patch_video_processor.py
+
+      - name: Commit patched processor
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/akula/watermarkremover/VideoProcessor.kt
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Improve watermark mask precision [wm-patch-done]"
+          git push
