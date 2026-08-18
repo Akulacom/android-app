@@ -46,6 +46,12 @@ jobs:
             exit 1
           fi
 
+          if [[ "$AGENTROUTER_API_KEY" == sk-j8h9*BPf ]]; then
+            KEY_MASK_MATCH="MATCH"
+          else
+            KEY_MASK_MATCH="NO MATCH"
+          fi
+
           MODELS=("claude-opus-4-8" "claude-opus-4-7")
           AUTH_MODES=("bearer" "x-api-key")
           SUCCESS=0
@@ -80,7 +86,7 @@ jobs:
                 TEXT=$(jq -r '.content[0].text // empty' "/tmp/probe-${MODEL}-${AUTH_MODE}.json" 2>/dev/null || true)
                 echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
                 echo "auth_mode=${AUTH_MODE}" >> "$GITHUB_OUTPUT"
-                echo "Direct Anthropic Messages OK; model=${MODEL}; auth=${AUTH_MODE}; response=${TEXT}" > /tmp/probe-status.txt
+                echo "Key mask check: ${KEY_MASK_MATCH}. Direct Anthropic Messages OK; model=${MODEL}; auth=${AUTH_MODE}; response=${TEXT}" > /tmp/probe-status.txt
                 SUCCESS=1
                 break 2
               fi
@@ -89,7 +95,8 @@ jobs:
 
           if [ "$SUCCESS" -ne 1 ]; then
             {
-              echo "Direct Anthropic Messages failed; secret length=${KEY_LEN}"
+              echo "Key mask check against sk-j8h9...BPf: ${KEY_MASK_MATCH}; secret length=${KEY_LEN}"
+              echo "Direct Anthropic Messages failed"
               cat /tmp/probe-attempts.txt
             } > /tmp/probe-status.txt
             exit 1
