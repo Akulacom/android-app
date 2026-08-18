@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,19 +23,42 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # Проект не содержит gradle-wrapper.jar (бинарник, который обычно
-      # генерируется самим Gradle — в окружении, где писался этот проект,
-      # Gradle не был установлен). Поэтому ставим Gradle через официальный
-      # GitHub Action вместо ./gradlew.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        id: build
+        shell: bash
+        run: |
+          set +e
+          gradle assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
+          CODE=${PIPESTATUS[0]}
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit $CODE
+
+      - name: Report build failure to Issue #1
+        if: failure() && steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          {
+            echo '### APK BUILD FAILURE'
+            echo
+            echo "Commit: ${{ github.sha }}"
+            echo '```text'
+            tail -120 /tmp/gradle-build.log
+            echo '```'
+          } > /tmp/build-comment.md
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/issues/1/comments" \
+            -f body="$(cat /tmp/build-comment.md)"
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
