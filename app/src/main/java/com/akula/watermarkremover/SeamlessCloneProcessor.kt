@@ -137,7 +137,10 @@ object SeamlessCloneProcessor {
         if (track.isEmpty()) return emptyList()
 
         val totalMs = durationMs.coerceAtLeast(1L)
-        val stepMs = 350L
+        // Шаг подстраиваем под лимит в 72 сегмента заранее, а не выбрасываем
+        // лишние сегменты потом — иначе между оставшимися сегментами появлялись
+        // дыры, где watermark оставался виден.
+        val stepMs = maxOf(350L, (totalMs + 71L) / 72L)
         val result = ArrayList<Op>()
 
         var t0 = 0L
@@ -179,10 +182,19 @@ object SeamlessCloneProcessor {
             t0 = t1
         }
 
-        return if (result.size <= 72) result else {
-            val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)
-            result.filterIndexed { index, _ -> index % stride == 0 }.take(72)
+        // Шаг уже подобран так, чтобы покрыть весь ролик без дыр,
+        // но страхуемся от выхода за лимит на очень длинных видео:
+        // расширяем окно каждого оставшегося сегмента до начала следующего,
+        // чтобы не было промежутков с видимым watermark.
+        if (result.size <= 72) return result
+
+        val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)
+        val kept = result.filterIndexed { index, _ -> index % stride == 0 }.toMutableList()
+        for (i in 0 until kept.size - 1) {
+            kept[i].endMs = kept[i + 1].startMs
         }
+        kept.lastOrNull()?.endMs = totalMs
+        return kept
     }
 
     private fun nearest(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
@@ -203,8 +215,10 @@ object SeamlessCloneProcessor {
     }
 
     private fun sanitizeAndPad(rect: RectF, w: Int, h: Int): RectF {
-        val px = max(2f, rect.width() * 0.025f)
-        val py = max(2f, rect.height() * 0.05f)
+        // Запас чуть больше OCR-рамки: закрывает полупрозрачный ореол букв,
+        // чтобы края watermark не просвечивали после наложения заплатки фона.
+        val px = max(3f, rect.width() * 0.05f)
+        val py = max(3f, rect.height() * 0.09f)
         val l = (rect.left - px).coerceIn(1f, w.toFloat() - 3f)
         val t = (rect.top - py).coerceIn(1f, h.toFloat() - 3f)
         val r = (rect.right + px).coerceIn(l + 2f, w.toFloat() - 1f)
@@ -320,8 +334,10 @@ object SeamlessCloneProcessor {
     }
 
     /**
-     * Совместимый с мобильным FFmpeg путь: только split/crop/overlay.
-     * Убраны color + alphamerge + boxblur, которые падали на части сборок FFmpegKit.
+     * Clone-fill с мягким пространственным alpha-feather без отдельного
+     * color/alphamerge источника. Alpha строится прямо из donor patch через geq,
+     * поэтому filter_complex остаётся стабильным и края заплатки не выглядят
+     * прямоугольником.
      */
     private fun buildFilter(ops: List<Op>): String {
         val sb = StringBuilder()
@@ -336,13 +352,17 @@ object SeamlessCloneProcessor {
             val sy = op.src.top.toInt().coerceAtLeast(0)
             val dx = op.dst.left.toInt().coerceAtLeast(0)
             val dy = op.dst.top.toInt().coerceAtLeast(0)
+            val feather = max(3, min(18, min(w, h) / 5))
 
-            sb.append("[donor$i]crop=$w:$h:$sx:$sy[patch$i];")
+            sb.append("[donor$i]crop=$w:$h:$sx:$sy,format=yuva444p,")
+            sb.append("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':")
+            sb.append("a='255*max(0,min(1,min(min(X/$feather,(W-1-X)/$feather),min(Y/$feather,(H-1-Y)/$feather))))'")
+            sb.append("[patch$i];")
 
             val baseIn = "[base$i]"
             val baseOut = if (i == ops.lastIndex) "[merged]" else "[base${i + 1}]"
             sb.append(baseIn)
-            sb.append("[patch$i]overlay=x=$dx:y=$dy:shortest=1:enable='between(t,${sec(op.startMs)},${sec(op.endMs)})'")
+            sb.append("[patch$i]overlay=x=$dx:y=$dy:shortest=1:format=auto:enable='between(t,${sec(op.startMs)},${sec(op.endMs)})'")
             sb.append(baseOut)
             sb.append(";")
         }
