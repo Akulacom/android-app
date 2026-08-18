@@ -33,17 +33,20 @@ jobs:
 
       - name: AgentRouter preflight and model selection
         id: router
+        continue-on-error: true
         env:
           AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           HTTP_CODE=$(curl -sS -o /tmp/models.json -w "%{http_code}" \
             -H "Authorization: Bearer ${AGENTROUTER_API_KEY}" \
-            https://co.agentrouter.org/v1/models)
+            https://co.agentrouter.org/v1/models || true)
+          echo "http=${HTTP_CODE}" >> "$GITHUB_OUTPUT"
           echo "AgentRouter /v1/models HTTP ${HTTP_CODE}"
+
           if [ "${HTTP_CODE}" != "200" ]; then
-            echo "AgentRouter key/preflight failed with HTTP ${HTTP_CODE}"
+            echo "AgentRouter key/preflight failed with HTTP ${HTTP_CODE}" > /tmp/router-status.txt
             exit 1
           fi
 
@@ -52,19 +55,55 @@ jobs:
             ([.data[].id | select(startswith("claude-opus-4-8"))][0]) //
             ([.data[].id | select(startswith("claude-opus-4-7"))][0]) //
             ([.data[].id | select(startswith("claude-"))][0]) // empty
-          ' /tmp/models.json)
+          ' /tmp/models.json 2>/dev/null || true)
 
           if [ -z "${MODEL}" ]; then
-            echo "No Claude model is available for this AgentRouter key"
-            jq -r '.data[].id' /tmp/models.json | head -50
+            echo "No Claude model found for this key" > /tmp/router-status.txt
             exit 1
           fi
 
-          echo "Selected Claude model: ${MODEL}"
           echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
+          echo "AgentRouter OK; selected model: ${MODEL}" > /tmp/router-status.txt
+
+      - name: Direct Anthropic Messages probe
+        id: probe
+        if: steps.router.outcome == 'success'
+        continue-on-error: true
+        env:
+          AGENTROUTER_API_KEY: ${{ secrets.AGENTROUTER_API_KEY }}
+          MODEL: ${{ steps.router.outputs.model }}
+        shell: bash
+        run: |
+          set -u
+          cat > /tmp/request.json <<EOF
+          {
+            "model": "${MODEL}",
+            "max_tokens": 16,
+            "messages": [{"role":"user","content":"Reply with exactly OK"}]
+          }
+          EOF
+
+          HTTP_CODE=$(curl -sS -o /tmp/probe-response.json -w "%{http_code}" \
+            -X POST https://co.agentrouter.org/v1/messages \
+            -H "Authorization: Bearer ${AGENTROUTER_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data-binary @/tmp/request.json || true)
+
+          echo "http=${HTTP_CODE}" >> "$GITHUB_OUTPUT"
+          if [ "${HTTP_CODE}" = "200" ]; then
+            TEXT=$(jq -r '.content[0].text // empty' /tmp/probe-response.json 2>/dev/null || true)
+            echo "Direct Messages API OK: ${TEXT}" > /tmp/probe-status.txt
+          else
+            ERROR=$(jq -r '.error.message // .message // "unknown error"' /tmp/probe-response.json 2>/dev/null || true)
+            echo "Direct Messages API failed: HTTP ${HTTP_CODE}; ${ERROR}" > /tmp/probe-status.txt
+            exit 1
+          fi
 
       - name: Run Claude Code CLI
         id: claude
+        if: steps.router.outcome == 'success' && steps.probe.outcome == 'success'
+        continue-on-error: true
         env:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.AGENTROUTER_API_KEY }}
           ANTHROPIC_BASE_URL: https://co.agentrouter.org
@@ -72,31 +111,46 @@ jobs:
           MODEL: ${{ steps.router.outputs.model }}
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             PROMPT=$(jq -r '.comment.body' "$GITHUB_EVENT_PATH")
           else
             PROMPT='Reply with exactly: AGENTROUTER CLI OK'
           fi
 
-          echo "Running Claude Code CLI with model ${MODEL}"
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --output-format text \
             --max-turns 3 \
             --allowedTools "Read,Glob,Grep" \
-            > /tmp/claude-response.txt
+            > /tmp/claude-response.txt 2> /tmp/claude-error.txt
+          CODE=$?
+          echo "exit_code=${CODE}" >> "$GITHUB_OUTPUT"
 
-          test -s /tmp/claude-response.txt
-          echo "Claude Code CLI returned a response successfully"
+          if [ "$CODE" -ne 0 ] || [ ! -s /tmp/claude-response.txt ]; then
+            tail -40 /tmp/claude-error.txt > /tmp/claude-status.txt
+            exit 1
+          fi
 
-      - name: Post Claude response to issue
-        if: github.event_name == 'issue_comment' && success()
+          echo "Claude Code CLI OK" > /tmp/claude-status.txt
+          exit 0
+
+      - name: Post diagnostic or Claude response to issue
+        if: github.event_name == 'issue_comment' && always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          BODY=$(cat /tmp/claude-response.txt)
+          if [ "${{ steps.router.outcome }}" != "success" ]; then
+            BODY="$(cat /tmp/router-status.txt 2>/dev/null || echo 'AgentRouter preflight failed')\n\nRun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          elif [ "${{ steps.probe.outcome }}" != "success" ]; then
+            BODY="$(cat /tmp/router-status.txt)\n$(cat /tmp/probe-status.txt 2>/dev/null || echo 'Direct API probe failed')\n\nRun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          elif [ "${{ steps.claude.outcome }}" != "success" ]; then
+            BODY="$(cat /tmp/router-status.txt)\n$(cat /tmp/probe-status.txt)\nClaude CLI failed (exit ${{ steps.claude.outputs.exit_code }}):\n$(cat /tmp/claude-status.txt 2>/dev/null || true)\n\nRun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          else
+            BODY=$(cat /tmp/claude-response.txt)
+          fi
+
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
