@@ -9,7 +9,9 @@ import android.graphics.RectF
 data class MaskKeyframe(
     val timeMs: Long,
     val rect: RectF,
-    val active: Boolean = true
+    val active: Boolean = true,
+    val trackId: Int = 0,
+    val confidence: Float = 1f
 )
 
 object MaskTracker {
