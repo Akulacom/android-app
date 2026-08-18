@@ -1,0 +1,82 @@
+name: Activate Seamless Clone
+
+on:
+  push:
+    paths:
+      - '.github/seamless-clone-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch VideoProcessor
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('app/src/main/java/com/akula/watermarkremover/VideoProcessor.kt')
+          s = p.read_text(encoding='utf-8')
+
+          anchor = '''                val videoSize = readVideoSize(inputPath)
+                if (videoSize == null) {
+                    callback.onError("Не удалось определить размер видео")
+                    return@Thread
+                }
+'''
+
+          insertion = anchor + '''
+
+                // Основной быстрый путь без размытого removelogo-пятна.
+                // Берём похожий фон из соседней области того же текущего кадра,
+                // поэтому текстура продолжает двигаться вместе с камерой.
+                SeamlessCloneProcessor.process(
+                    inputPath = inputPath,
+                    outputPath = outputPath,
+                    keyframes = processingKeyframes,
+                    durationMs = durationMs,
+                    videoWidth = videoSize.first,
+                    videoHeight = videoSize.second,
+                    callback = object : SeamlessCloneProcessor.Callback {
+                        override fun onProgress(percent: Int) {
+                            callback.onProgress(percent)
+                        }
+
+                        override fun onSuccess(outputPath: String) {
+                            callback.onSuccess(outputPath)
+                        }
+
+                        override fun onError(message: String) {
+                            callback.onError(message)
+                        }
+                    }
+                )
+                return@Thread
+'''
+
+          if 'SeamlessCloneProcessor.process(' in s:
+              print('Already activated')
+          else:
+              if anchor not in s:
+                  raise SystemExit('VideoProcessor anchor not found')
+              s = s.replace(anchor, insertion, 1)
+              p.write_text(s, encoding='utf-8')
+              print('Activated seamless clone path')
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/akula/watermarkremover/VideoProcessor.kt
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Use seamless clone fill for fast removal"
+            git push
+          fi
