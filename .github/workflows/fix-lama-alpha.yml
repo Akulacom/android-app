@@ -1,0 +1,170 @@
+name: Fix LaMa alpha artifacts
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-lama-alpha.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Fix transparent LaMa patch blending
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt')
+          s = p.read_text(encoding='utf-8')
+
+          old_feather = '''    private fun featherPatch(original: Bitmap, generated: Bitmap): Bitmap {
+              val width = original.width
+              val height = original.height
+              val size = width * height
+              val originalPixels = IntArray(size)
+              val generatedPixels = IntArray(size)
+              val outPixels = IntArray(size)
+
+              original.getPixels(originalPixels, 0, width, 0, 0, width, height)
+              generated.getPixels(generatedPixels, 0, width, 0, 0, width, height)
+
+              val feather = max(3f, min(width, height) * 0.08f)
+              for (y in 0 until height) {
+                  for (x in 0 until width) {
+                      val edge = minOf(
+                          x.toFloat(),
+                          (width - 1 - x).toFloat(),
+                          y.toFloat(),
+                          (height - 1 - y).toFloat()
+                      )
+                      val alpha = (edge / feather).coerceIn(0f, 1f)
+                      val index = y * width + x
+                      outPixels[index] = blend(
+                          originalPixels[index],
+                          generatedPixels[index],
+                          alpha
+                      )
+                  }
+              }
+
+              return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                  it.setPixels(outPixels, 0, width, 0, 0, width, height)
+              }
+          }
+'''
+
+          new_feather = '''    private fun featherPatch(original: Bitmap, generated: Bitmap): Bitmap {
+              val width = original.width
+              val height = original.height
+              val size = width * height
+              val generatedPixels = IntArray(size)
+              val outPixels = IntArray(size)
+
+              generated.getPixels(generatedPixels, 0, width, 0, 0, width, height)
+
+              // Важно: patch должен быть реально прозрачным по краям.
+              // Раньше края только смешивались с кадром AI-якоря, но PNG оставался
+              // полностью непрозрачным. На движущемся видео это давало видимый
+              // прямоугольник из старого кадра.
+              val feather = max(6f, min(width, height) * 0.24f)
+              for (y in 0 until height) {
+                  for (x in 0 until width) {
+                      val edge = minOf(
+                          x.toFloat(),
+                          (width - 1 - x).toFloat(),
+                          y.toFloat(),
+                          (height - 1 - y).toFloat()
+                      )
+                      val t = (edge / feather).coerceIn(0f, 1f)
+                      val smooth = t * t * (3f - 2f * t)
+                      val index = y * width + x
+                      val g = generatedPixels[index]
+                      outPixels[index] = Color.argb(
+                          (255f * smooth).roundToInt().coerceIn(0, 255),
+                          Color.red(g),
+                          Color.green(g),
+                          Color.blue(g)
+                      )
+                  }
+              }
+
+              return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                  it.setPixels(outPixels, 0, width, 0, 0, width, height)
+              }
+          }
+'''
+
+          old_blend = '''    private fun blend(a: Int, b: Int, alpha: Float): Int {
+              if (alpha <= 0f) return a
+              if (alpha >= 1f) return b
+
+              val inv = 1f - alpha
+              return Color.rgb(
+                  (Color.red(a) * inv + Color.red(b) * alpha).toInt().coerceIn(0, 255),
+                  (Color.green(a) * inv + Color.green(b) * alpha).toInt().coerceIn(0, 255),
+                  (Color.blue(a) * inv + Color.blue(b) * alpha).toInt().coerceIn(0, 255)
+              )
+          }
+'''
+
+          new_blend = '''    private fun blend(a: Int, b: Int, alpha: Float): Int {
+              if (alpha <= 0f) return a
+              if (alpha >= 1f) return b
+
+              val inv = 1f - alpha
+              return Color.argb(
+                  (Color.alpha(a) * inv + Color.alpha(b) * alpha).roundToInt().coerceIn(0, 255),
+                  (Color.red(a) * inv + Color.red(b) * alpha).roundToInt().coerceIn(0, 255),
+                  (Color.green(a) * inv + Color.green(b) * alpha).roundToInt().coerceIn(0, 255),
+                  (Color.blue(a) * inv + Color.blue(b) * alpha).roundToInt().coerceIn(0, 255)
+              )
+          }
+'''
+
+          if old_feather not in s:
+              raise SystemExit('featherPatch block not found')
+          if old_blend not in s:
+              raise SystemExit('blend block not found')
+
+          s = s.replace(old_feather, new_feather, 1)
+          s = s.replace(old_blend, new_blend, 1)
+          p.write_text(s, encoding='utf-8')
+          print('LaMa alpha patch fixed')
+          PY
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Commit verified fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt
+          if ! git diff --cached --quiet; then
+            git commit -m "Fix LaMa rectangular patch artifacts"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk-alpha-fix
+          path: app/build/outputs/apk/debug/app-debug.apk
