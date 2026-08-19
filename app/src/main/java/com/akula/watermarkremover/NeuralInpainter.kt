@@ -377,12 +377,21 @@ object NeuralInpainter {
             contextH
         )
 
-        val resized = Bitmap.createScaledBitmap(
-            contextBitmap,
-            MODEL_INPUT_SIZE,
-            MODEL_INPUT_SIZE,
-            true
-        )
+        // Android may return the source Bitmap when no scaling is required.
+// Keep an independent object so recycle() cannot invalidate contextBitmap/source.
+val resized = if (
+    contextBitmap.width == MODEL_INPUT_SIZE &&
+    contextBitmap.height == MODEL_INPUT_SIZE
+) {
+    contextBitmap.copy(Bitmap.Config.ARGB_8888, false)
+} else {
+    Bitmap.createScaledBitmap(
+        contextBitmap,
+        MODEL_INPUT_SIZE,
+        MODEL_INPUT_SIZE,
+        true
+    )
+}
 
         val relativeMask = RectF(
             target.left - contextLeft,
@@ -415,13 +424,21 @@ object NeuralInpainter {
             resized.recycle()
         }
 
-        val generatedContext = Bitmap.createScaledBitmap(
-            generated512,
-            contextW,
-            contextH,
-            true
-        )
-        generated512.recycle()
+        // Same ownership rule for model output: if context is exactly 512x512,
+// createScaledBitmap may return generated512 itself.
+val generatedContext = if (
+    generated512.width == contextW && generated512.height == contextH
+) {
+    generated512.copy(Bitmap.Config.ARGB_8888, false)
+} else {
+    Bitmap.createScaledBitmap(
+        generated512,
+        contextW,
+        contextH,
+        true
+    )
+}
+generated512.recycle()
 
         val output = source.copy(Bitmap.Config.ARGB_8888, true)
 
