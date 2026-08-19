@@ -39,7 +39,6 @@ jobs:
           path = Path('app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt')
           s = path.read_text(encoding='utf-8')
 
-          # Patch by stable Kotlin boundaries, never by approximate whitespace.
           start = s.find('        val resized = Bitmap.createScaledBitmap(')
           end = s.find('\n\n        val relativeMask = RectF(', start)
           if start < 0 or end < 0:
@@ -110,29 +109,62 @@ jobs:
           if missing:
               raise SystemExit('Required invariants missing: ' + ', '.join(missing))
 
-          for left, right in [('(', ')'), ('{', '}'), ('[', ']')]:
-              if s.count(left) != s.count(right):
-                  raise SystemExit(f'Unbalanced {left}{right}: {s.count(left)} != {s.count(right)}')
-
           path.write_text(s, encoding='utf-8')
           print('SOURCE AUDIT PASS')
           print('No stale-frame interpolation/overlay symbols remain')
           print('Bitmap ownership guards installed')
           PY
 
-      - name: Build debug APK
-        id: build
+      - name: Bundle exact LaMa model used by normal build
+        if: steps.patch.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 4 --retry-delay 3 \
+            -o app/src/main/assets/lama_512_int8.onnx \
+            "https://huggingface.co/g-ronimo/lama/resolve/8e20140b3ec5696f14ac3fac3b34b179ae4e1a15/lama_512_int8.onnx?download=true"
+          echo "cab19978adc306622fe37ef60d4a52103b99c98141d499c2a2366a7ed1255dbe  app/src/main/assets/lama_512_int8.onnx" | sha256sum -c -
+
+      - name: Build debug APK with captured log
+        id: build
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/lama-hardening-build.log
+          CODE=${PIPESTATUS[0]}
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+          exit $CODE
+
+      - name: Report diagnostics
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### LAMA CURRENT-FRAME HARDENING'
+            echo
+            echo "Patch: ${{ steps.patch.outcome }}"
+            echo "Build: ${{ steps.build.outcome }}"
+            echo "Source: $GITHUB_SHA"
+            echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [ -f /tmp/lama-hardening-build.log ]; then
+              echo
+              echo '```text'
+              tail -100 /tmp/lama-hardening-build.log
+              echo '```'
+            fi
+          } > /tmp/lama-hardening-report.md
+          gh issue comment 1 --body-file /tmp/lama-hardening-report.md
 
       - name: Commit only verified source
-        if: success()
+        if: steps.patch.outcome == 'success' && steps.build.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf app/src/main/assets
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt
@@ -140,9 +172,3 @@ jobs:
             git commit -m "Harden LaMa current-frame bitmap ownership"
             git push origin HEAD:main
           fi
-
-      - name: Report result
-        if: always()
-        shell: bash
-        run: |
-          gh issue comment 1 --body "### LAMA CURRENT-FRAME HARDENING\nPatch: ${{ steps.patch.outcome }}\nBuild: ${{ steps.build.outcome }}\nSource: $GITHUB_SHA"
