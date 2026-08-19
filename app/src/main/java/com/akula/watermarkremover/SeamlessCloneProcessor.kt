@@ -148,7 +148,7 @@ object SeamlessCloneProcessor {
         while (t0 < totalMs) {
             val t1 = (t0 + stepMs).coerceAtMost(totalMs)
             val mid = (t0 + t1) / 2L
-            val state = nearest(track, mid)
+            val state = repairState(track, mid)
 
             if (state.active && state.rect.width() >= 4f && state.rect.height() >= 4f) {
                 val dst = sanitizeAndPad(state.rect, videoWidth, videoHeight)
@@ -197,6 +197,37 @@ object SeamlessCloneProcessor {
         return kept
     }
 
+    /** Bridge only a short inactive hole surrounded by the same-sized track. */
+    private fun repairState(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
+        val direct = nearest(sorted, timeMs)
+        if (direct.active) return direct
+
+        val previous = sorted.lastOrNull { it.timeMs <= timeMs && it.active }
+        val next = sorted.firstOrNull { it.timeMs >= timeMs && it.active }
+        if (previous == null || next == null) return direct
+        if (next.timeMs - previous.timeMs > 1350L) return direct
+
+        val pw = previous.rect.width().coerceAtLeast(1f)
+        val ph = previous.rect.height().coerceAtLeast(1f)
+        val nw = next.rect.width().coerceAtLeast(1f)
+        val nh = next.rect.height().coerceAtLeast(1f)
+        val sizeRatio = max(max(pw / nw, nw / pw), max(ph / nh, nh / ph))
+        if (sizeRatio > 2.0f) return direct
+
+        val chosen = if (
+            kotlin.math.abs(previous.timeMs - timeMs) <=
+            kotlin.math.abs(next.timeMs - timeMs)
+        ) previous else next
+
+        return MaskKeyframe(
+            timeMs = timeMs,
+            rect = RectF(chosen.rect),
+            active = true,
+            trackId = chosen.trackId,
+            confidence = chosen.confidence * 0.85f
+        )
+    }
+
     private fun nearest(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
         if (sorted.size == 1) return sorted[0]
         if (timeMs <= sorted.first().timeMs) return sorted.first()
@@ -217,8 +248,8 @@ object SeamlessCloneProcessor {
     private fun sanitizeAndPad(rect: RectF, w: Int, h: Int): RectF {
         // Запас чуть больше OCR-рамки: закрывает полупрозрачный ореол букв,
         // чтобы края watermark не просвечивали после наложения заплатки фона.
-        val px = max(3f, rect.width() * 0.05f)
-        val py = max(3f, rect.height() * 0.09f)
+        val px = max(5f, rect.width() * 0.09f)
+        val py = max(5f, rect.height() * 0.15f)
         val l = (rect.left - px).coerceIn(1f, w.toFloat() - 3f)
         val t = (rect.top - py).coerceIn(1f, h.toFloat() - 3f)
         val r = (rect.right + px).coerceIn(l + 2f, w.toFloat() - 1f)
@@ -274,13 +305,19 @@ object SeamlessCloneProcessor {
     private fun borderScore(bitmap: Bitmap, dst: RectF, src: RectF): Double {
         val w = min(dst.width().toInt(), src.width().toInt()).coerceAtLeast(2)
         val h = min(dst.height().toInt(), src.height().toInt()).coerceAtLeast(2)
-        val samples = 20
+        val samples = 28
         var total = 0.0
         var count = 0
 
         fun diff(x1: Int, y1: Int, x2: Int, y2: Int) {
-            val p1 = bitmap.getPixel(x1.coerceIn(0, bitmap.width - 1), y1.coerceIn(0, bitmap.height - 1))
-            val p2 = bitmap.getPixel(x2.coerceIn(0, bitmap.width - 1), y2.coerceIn(0, bitmap.height - 1))
+            val p1 = bitmap.getPixel(
+                x1.coerceIn(0, bitmap.width - 1),
+                y1.coerceIn(0, bitmap.height - 1)
+            )
+            val p2 = bitmap.getPixel(
+                x2.coerceIn(0, bitmap.width - 1),
+                y2.coerceIn(0, bitmap.height - 1)
+            )
             val dr = Color.red(p1) - Color.red(p2)
             val dg = Color.green(p1) - Color.green(p2)
             val db = Color.blue(p1) - Color.blue(p2)
@@ -288,17 +325,22 @@ object SeamlessCloneProcessor {
             count++
         }
 
+        // Destination samples are taken just outside the repair rectangle.
+        // This compares the donor to clean surrounding background, not to the
+        // semi-transparent watermark pixels that we are trying to remove.
+        val outside = 4
         for (i in 0 until samples) {
             val f = i.toFloat() / (samples - 1).toFloat()
-            val x1 = dst.left.toInt() + (f * (w - 1)).toInt()
-            val x2 = src.left.toInt() + (f * (w - 1)).toInt()
-            diff(x1, dst.top.toInt(), x2, src.top.toInt())
-            diff(x1, dst.bottom.toInt() - 1, x2, src.bottom.toInt() - 1)
 
-            val y1 = dst.top.toInt() + (f * (h - 1)).toInt()
-            val y2 = src.top.toInt() + (f * (h - 1)).toInt()
-            diff(dst.left.toInt(), y1, src.left.toInt(), y2)
-            diff(dst.right.toInt() - 1, y1, src.right.toInt() - 1, y2)
+            val dstX = dst.left.toInt() + (f * (w - 1)).toInt()
+            val srcX = src.left.toInt() + (f * (w - 1)).toInt()
+            diff(dstX, dst.top.toInt() - outside, srcX, src.top.toInt())
+            diff(dstX, dst.bottom.toInt() + outside - 1, srcX, src.bottom.toInt() - 1)
+
+            val dstY = dst.top.toInt() + (f * (h - 1)).toInt()
+            val srcY = src.top.toInt() + (f * (h - 1)).toInt()
+            diff(dst.left.toInt() - outside, dstY, src.left.toInt(), srcY)
+            diff(dst.right.toInt() + outside - 1, dstY, src.right.toInt() - 1, srcY)
         }
 
         return if (count == 0) Double.MAX_VALUE else total / count.toDouble()

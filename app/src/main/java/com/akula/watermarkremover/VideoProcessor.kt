@@ -837,7 +837,11 @@ object VideoProcessor {
             val sourceHits = chosen.uniqueHits
             if (sourceHits.size < 2) return null
 
-            val maxFillGapMs = stepMs + stepMs / 2L
+            val knownTrack = knownWatermarkBonus(chosen.group.key) > 0f
+            // Known floating watermarks are translucent and OCR can miss one or
+            // two checks while the logo is still visible. Bridge only short gaps.
+            val nearestFillMs = if (knownTrack) stepMs * 2L else stepMs + stepMs / 2L
+            val surroundedBridgeMs = if (knownTrack) stepMs * 3L else stepMs * 2L
             val result = mutableListOf<MaskKeyframe>()
 
             for (timeMs in times) {
@@ -845,12 +849,21 @@ object VideoProcessor {
                 val nearest = exact ?: sourceHits.minByOrNull {
                     kotlin.math.abs(it.timeMs - timeMs)
                 }
+                val before = sourceHits.lastOrNull { it.timeMs <= timeMs }
+                val after = sourceHits.firstOrNull { it.timeMs >= timeMs }
+                val surroundedMiss = before != null && after != null &&
+                    after.timeMs >= before.timeMs &&
+                    after.timeMs - before.timeMs <= surroundedBridgeMs
 
-                if (nearest != null && kotlin.math.abs(nearest.timeMs - timeMs) <= maxFillGapMs) {
+                val useRect = nearest != null && (
+                    kotlin.math.abs(nearest.timeMs - timeMs) <= nearestFillMs || surroundedMiss
+                )
+
+                if (useRect) {
                     result.add(
                         MaskKeyframe(
                             timeMs = timeMs,
-                            rect = RectF(nearest.rect),
+                            rect = RectF(nearest!!.rect),
                             active = true
                         )
                     )

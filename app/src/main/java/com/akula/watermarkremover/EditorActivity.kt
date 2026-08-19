@@ -1089,22 +1089,57 @@ class EditorActivity : AppCompatActivity() {
         binding.tvStatus.text = "Обработка..."
 
         if (binding.radioQuality.isChecked) {
-            NeuralInpainter.process(
-                context = this,
+            val fastBasePath = File(
+                outDir,
+                "quality_fast_${System.currentTimeMillis()}.mp4"
+            ).absolutePath
+
+            VideoProcessor.removeWatermarkAndExport(
                 inputPath = inputPath,
-                outputPath = outputPath,
+                outputPath = fastBasePath,
                 keyframes = keyframes,
-                videoDurationMs = videoDurationMs,
-                callback = object : NeuralInpainter.Callback {
-                    override fun onProgress(percent: Int, stage: String) {
+                durationMs = videoDurationMs,
+                callback = object : VideoProcessor.Callback {
+                    override fun onProgress(percent: Int) {
                         runOnUiThread {
-                            binding.progressBar.progress = percent
-                            binding.tvStatus.text = "$stage — $percent%"
+                            binding.progressBar.progress = (percent * 35 / 100).coerceIn(0, 35)
+                            binding.tvStatus.text = "Качество 1/2: очистка FAST — $percent%"
                         }
                     }
 
-                    override fun onSuccess(outputPath: String) = onProcessingSuccess(outputPath)
-                    override fun onError(message: String) = onProcessingError(message)
+                    override fun onSuccess(fastPath: String) {
+                        NeuralInpainter.process(
+                            context = this@EditorActivity,
+                            inputPath = fastPath,
+                            outputPath = outputPath,
+                            keyframes = keyframes,
+                            videoDurationMs = videoDurationMs,
+                            callback = object : NeuralInpainter.Callback {
+                                override fun onProgress(percent: Int, stage: String) {
+                                    runOnUiThread {
+                                        binding.progressBar.progress =
+                                            (35 + percent * 65 / 100).coerceIn(35, 99)
+                                        binding.tvStatus.text = "Качество 2/2: $stage"
+                                    }
+                                }
+
+                                override fun onSuccess(outputPath: String) {
+                                    try { File(fastPath).delete() } catch (_: Throwable) {}
+                                    onProcessingSuccess(outputPath)
+                                }
+
+                                override fun onError(message: String) {
+                                    try { File(fastPath).delete() } catch (_: Throwable) {}
+                                    onProcessingError(message)
+                                }
+                            }
+                        )
+                    }
+
+                    override fun onError(message: String) {
+                        try { File(fastBasePath).delete() } catch (_: Throwable) {}
+                        onProcessingError(message)
+                    }
                 }
             )
         } else {

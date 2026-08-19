@@ -175,50 +175,70 @@ object NeuralInpainter {
                 return
             }
 
+            // FAST has already removed the watermark on every frame.
+            // LaMa is only a sparse quality refinement, not 600-900 AI calls.
+            val aiStride = when {
+                totalFrames >= 800 -> 15
+                totalFrames >= 450 -> 10
+                totalFrames >= 250 -> 7
+                else -> 4
+            }
+            val expectedAi = ((activeFrames + aiStride - 1) / aiStride).coerceAtLeast(1)
             var aiDone = 0
+            var activeOrdinal = 0
+            var wasActive = false
+
             for (index in frameFiles.indices) {
                 val sourceFile = frameFiles[index]
                 val outputFile = File(outFramesDir, sourceFile.name)
                 val mask = masks[index]
+                val active = isActiveMask(mask)
 
-                if (!isActiveMask(mask)) {
+                if (!active) {
                     sourceFile.copyTo(outputFile, overwrite = true)
+                    activeOrdinal = 0
+                    wasActive = false
                 } else {
-                    val sourceBitmap = BitmapFactory.decodeFile(sourceFile.absolutePath)
-                        ?: throw IllegalStateException(
-                            "Не удалось открыть кадр ${index + 1}/$totalFrames"
-                        )
+                    activeOrdinal++
+                    val runAi = !wasActive || (activeOrdinal - 1) % aiStride == 0
 
-                    val resultBitmap = try {
-                        inpaintCurrentFrame(
-                            env = ortEnv,
-                            session = session,
-                            source = sourceBitmap,
-                            rawMask = mask
-                        )
-                    } finally {
-                        if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
-                    }
+                    if (!runAi) {
+                        // Keep THIS already-cleaned current frame. No stale frame copy.
+                        sourceFile.copyTo(outputFile, overwrite = true)
+                    } else {
+                        val sourceBitmap = BitmapFactory.decodeFile(sourceFile.absolutePath)
+                            ?: throw IllegalStateException("Не удалось открыть активный кадр")
 
-                    try {
-                        outputFile.outputStream().use { output ->
-                            if (!resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                                throw IllegalStateException(
-                                    "Не удалось сохранить кадр ${index + 1}/$totalFrames"
-                                )
-                            }
+                        val resultBitmap = try {
+                            inpaintCurrentFrame(
+                                env = ortEnv,
+                                session = session,
+                                source = sourceBitmap,
+                                rawMask = mask
+                            )
+                        } finally {
+                            if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
                         }
-                    } finally {
-                        if (!resultBitmap.isRecycled) resultBitmap.recycle()
-                    }
 
-                    aiDone++
+                        try {
+                            outputFile.outputStream().use { output ->
+                                if (!resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                                    throw IllegalStateException("Не удалось сохранить LaMa-кадр")
+                                }
+                            }
+                        } finally {
+                            if (!resultBitmap.isRecycled) resultBitmap.recycle()
+                        }
+                        aiDone++
+                    }
+                    wasActive = true
                 }
 
                 val percent = 7 + ((index + 1) * 83 / totalFrames)
+                val videoPercent = ((index + 1) * 100 / totalFrames).coerceIn(0, 100)
                 callback.onProgress(
                     percent.coerceIn(7, 90),
-                    "LaMa INT8: $aiDone/$activeFrames AI • кадр ${index + 1}/$totalFrames"
+                    "LaMa INT8 гибрид: $aiDone/~$expectedAi AI • видео $videoPercent%"
                 )
             }
 
