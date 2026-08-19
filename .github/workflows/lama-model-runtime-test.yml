@@ -1,0 +1,139 @@
+name: LaMa real model runtime test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lama-model-runtime-test.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  real-inference:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ONNX Runtime test stack
+        run: |
+          python -m pip install --disable-pip-version-check --quiet \
+            onnxruntime==1.18.0 numpy==1.26.4 pillow==10.4.0
+
+      - name: Download exact production LaMa model
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 4 --retry-delay 3 \
+            -o /tmp/lama_512_int8.onnx \
+            "https://huggingface.co/g-ronimo/lama/resolve/8e20140b3ec5696f14ac3fac3b34b179ae4e1a15/lama_512_int8.onnx?download=true"
+          echo "cab19978adc306622fe37ef60d4a52103b99c98141d499c2a2366a7ed1255dbe  /tmp/lama_512_int8.onnx" | sha256sum -c -
+
+      - name: Run real CPU inference and validate model contract
+        id: test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' | tee /tmp/lama-runtime-test.log
+          import time
+          import numpy as np
+          import onnxruntime as ort
+          from PIL import Image
+
+          path = '/tmp/lama_512_int8.onnx'
+          session = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+
+          inputs = session.get_inputs()
+          outputs = session.get_outputs()
+          assert len(inputs) == 1, f'expected 1 input, got {len(inputs)}'
+          assert inputs[0].name == 'input', f'unexpected input name: {inputs[0].name}'
+          assert list(inputs[0].shape) == [1, 4, 512, 512], f'unexpected input shape: {inputs[0].shape}'
+          assert len(outputs) == 1, f'expected 1 output, got {len(outputs)}'
+          assert list(outputs[0].shape) == [1, 3, 512, 512], f'unexpected output shape: {outputs[0].shape}'
+
+          # Deterministic high-frequency + smooth synthetic frame so the network
+          # sees both texture and gradients. Same tensor layout as Android code.
+          yy, xx = np.mgrid[0:512, 0:512]
+          rgb = np.empty((3, 512, 512), dtype=np.float32)
+          rgb[0] = xx / 511.0
+          rgb[1] = yy / 511.0
+          rgb[2] = ((xx // 24 + yy // 24) % 2).astype(np.float32) * 0.65 + 0.15
+
+          mask = np.zeros((512, 512), dtype=np.float32)
+          mask[205:307, 170:342] = 1.0
+
+          masked = rgb.copy()
+          masked[:, mask > 0.5] = 0.0
+          tensor = np.concatenate([masked, mask[None, :, :]], axis=0)[None, :, :, :]
+
+          assert tensor.shape == (1, 4, 512, 512)
+          assert tensor.dtype == np.float32
+          assert np.all(tensor[0, :3, 205:307, 170:342] == 0.0)
+          assert np.all(tensor[0, 3, 205:307, 170:342] == 1.0)
+
+          t0 = time.perf_counter()
+          result = session.run(None, {'input': tensor})[0]
+          elapsed = time.perf_counter() - t0
+
+          assert result.shape == (1, 3, 512, 512), result.shape
+          assert result.dtype == np.float32, result.dtype
+          assert np.isfinite(result).all(), 'model output contains NaN/Inf'
+
+          mn = float(result.min())
+          mx = float(result.max())
+          assert mn > -0.5 and mx < 1.5, (mn, mx)
+
+          hole = result[0, :, 205:307, 170:342]
+          assert float(hole.std()) > 0.01, 'inpainted hole collapsed to near-constant output'
+
+          # Determinism sanity check with exactly the same input/session.
+          result2 = session.run(None, {'input': tensor})[0]
+          max_repeat_diff = float(np.max(np.abs(result - result2)))
+          assert max_repeat_diff < 1e-5, max_repeat_diff
+
+          preview = np.clip(result[0].transpose(1, 2, 0), 0.0, 1.0)
+          Image.fromarray((preview * 255.0 + 0.5).astype(np.uint8)).save('/tmp/lama-runtime-output.png')
+
+          print('MODEL RUNTIME PASS')
+          print('input:', inputs[0].name, inputs[0].shape, inputs[0].type)
+          print('output:', outputs[0].name, outputs[0].shape, outputs[0].type)
+          print(f'first CPU inference: {elapsed:.3f}s')
+          print(f'output range: {mn:.6f} .. {mx:.6f}')
+          print(f'hole std: {float(hole.std()):.6f}')
+          print(f'repeat max abs diff: {max_repeat_diff:.9f}')
+          PY
+
+      - name: Upload inference preview
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lama-real-inference-preview
+          path: /tmp/lama-runtime-output.png
+
+      - name: Report to Issue #1
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '### LAMA REAL MODEL TEST'
+            echo
+            echo "Result: ${{ steps.test.outcome }}"
+            echo "Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [ -f /tmp/lama-runtime-test.log ]; then
+              echo
+              echo '```text'
+              cat /tmp/lama-runtime-test.log
+              echo '```'
+            fi
+          } > /tmp/lama-real-report.md
+          gh issue comment 1 --body-file /tmp/lama-real-report.md
