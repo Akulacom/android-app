@@ -28,6 +28,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
       - name: Harden Bitmap ownership and audit pipeline
         id: patch
         shell: bash
@@ -133,8 +138,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/lama-hardening-build.log
+          gradle assembleDebug --no-daemon 2>&1 | tee /tmp/lama-hardening-build.log
           CODE=${PIPESTATUS[0]}
           echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
           exit $CODE
