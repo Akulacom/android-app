@@ -133,6 +133,23 @@ object NeuralInpainter {
             val sortedKeyframes = keyframes.sortedBy { it.timeMs }
             val totalFrames = frameFiles.size
 
+            // Автоматический баланс скорости/качества:
+            // <300 кадров  -> каждый кадр
+            // 300-799      -> каждый 2-й кадр
+            // 800+         -> каждый 3-й кадр
+            val frameStride = when {
+                totalFrames >= 800 -> 3
+                totalFrames >= 300 -> 2
+                else -> 1
+            }
+
+            val estimatedNeuralFrames =
+                (totalFrames + frameStride - 1) / frameStride
+
+            var neuralRuns = 0
+            var lastCleanBitmap: Bitmap? = null
+            var lastCleanMask: RectF? = null
+
             frameFiles.forEachIndexed { index, frameFile ->
                 val timeMs = if (totalFrames > 1) {
                     (index.toLong() * videoDurationMs) / (totalFrames - 1)
@@ -142,19 +159,64 @@ object NeuralInpainter {
                 val srcBitmap = BitmapFactory.decodeFile(frameFile.absolutePath)
                     ?: throw IllegalStateException("Не удалось открыть ${frameFile.name}")
 
-                val resultBitmap = inpaintFrame(env, session, srcBitmap, maskRect)
+                val maskActive =
+                    maskRect.width() >= 2f && maskRect.height() >= 2f
+
+                val runNeural = maskActive && (
+                    lastCleanBitmap == null ||
+                    lastCleanMask == null ||
+                    index % frameStride == 0
+                )
+
+                val resultBitmap = when {
+                    !maskActive -> {
+                        lastCleanBitmap?.recycle()
+                        lastCleanBitmap = null
+                        lastCleanMask = null
+                        srcBitmap
+                    }
+
+                    runNeural -> {
+                        neuralRuns++
+                        inpaintFrame(env, session, srcBitmap, maskRect)
+                    }
+
+                    else -> {
+                        reusePreviousPatch(
+                            srcBitmap = srcBitmap,
+                            previousClean = lastCleanBitmap!!,
+                            previousMaskRaw = lastCleanMask!!,
+                            currentMaskRaw = maskRect
+                        )
+                    }
+                }
+
+                if (runNeural) {
+                    lastCleanBitmap?.recycle()
+                    lastCleanBitmap =
+                        resultBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                    lastCleanMask = RectF(maskRect)
+                }
+
                 File(outFramesDir, frameFile.name).outputStream().use { out ->
                     resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
                 }
-                srcBitmap.recycle()
-                resultBitmap.recycle()
 
-                val neuralPercent = 20 + (((index + 1) * 75) / totalFrames)
+                if (resultBitmap !== srcBitmap) {
+                    resultBitmap.recycle()
+                }
+                srcBitmap.recycle()
+
+                val neuralPercent =
+                    20 + (((index + 1) * 75) / totalFrames)
+
                 callback.onProgress(
                     neuralPercent,
-                    "LaMa: кадр ${index + 1}/$totalFrames"
+                    "LaMa: нейро $neuralRuns/~$estimatedNeuralFrames • кадр ${index + 1}/$totalFrames"
                 )
             }
+
+            lastCleanBitmap?.recycle()
         }
 
         callback.onProgress(96, "Сборка видео")
@@ -351,6 +413,112 @@ object NeuralInpainter {
 
         result.setPixels(srcPixels, 0, origW, 0, 0, origW, origH)
         generated.recycle()
+        return result
+    }
+
+    /**
+     * Для пропущенного кадра сохраняем сам текущий кадр,
+     * а из последнего обработанного LaMa-кадра переносим только
+     * очищенную область watermark. Поэтому движение видео не замирает.
+     */
+    private fun reusePreviousPatch(
+        srcBitmap: Bitmap,
+        previousClean: Bitmap,
+        previousMaskRaw: RectF,
+        currentMaskRaw: RectF
+    ): Bitmap {
+        val width = srcBitmap.width
+        val height = srcBitmap.height
+
+        if (previousClean.width != width || previousClean.height != height) {
+            return srcBitmap.copy(Bitmap.Config.ARGB_8888, true)
+        }
+
+        val previousMask =
+            expandedMask(previousMaskRaw, width, height)
+        val currentMask =
+            expandedMask(currentMaskRaw, width, height)
+
+        val result =
+            srcBitmap.copy(Bitmap.Config.ARGB_8888, true)
+
+        val currentPixels = IntArray(width * height)
+        val previousPixels = IntArray(width * height)
+
+        result.getPixels(
+            currentPixels, 0, width,
+            0, 0, width, height
+        )
+
+        previousClean.getPixels(
+            previousPixels, 0, width,
+            0, 0, width, height
+        )
+
+        val left =
+            currentMask.left.toInt().coerceIn(0, width - 1)
+        val top =
+            currentMask.top.toInt().coerceIn(0, height - 1)
+        val right =
+            currentMask.right.toInt().coerceIn(left + 1, width)
+        val bottom =
+            currentMask.bottom.toInt().coerceIn(top + 1, height)
+
+        val currentW = currentMask.width().coerceAtLeast(1f)
+        val currentH = currentMask.height().coerceAtLeast(1f)
+        val previousW = previousMask.width().coerceAtLeast(1f)
+        val previousH = previousMask.height().coerceAtLeast(1f)
+
+        val feather = maxOf(
+            3f,
+            minOf(currentW, currentH) * 0.06f
+        )
+
+        for (y in top until bottom) {
+            val v =
+                ((y - currentMask.top) / currentH).coerceIn(0f, 1f)
+
+            val sourceY =
+                (previousMask.top + v * previousH)
+                    .toInt()
+                    .coerceIn(0, height - 1)
+
+            for (x in left until right) {
+                val u =
+                    ((x - currentMask.left) / currentW)
+                        .coerceIn(0f, 1f)
+
+                val sourceX =
+                    (previousMask.left + u * previousW)
+                        .toInt()
+                        .coerceIn(0, width - 1)
+
+                val edgeDistance = minOf(
+                    x - currentMask.left,
+                    currentMask.right - x,
+                    y - currentMask.top,
+                    currentMask.bottom - y
+                ).coerceAtLeast(0f)
+
+                val alpha =
+                    (edgeDistance / feather).coerceIn(0f, 1f)
+
+                val dstIndex = y * width + x
+                val srcIndex = sourceY * width + sourceX
+
+                currentPixels[dstIndex] = blend(
+                    currentPixels[dstIndex],
+                    previousPixels[srcIndex],
+                    alpha
+                )
+            }
+        }
+
+        result.setPixels(
+            currentPixels, 0, width,
+            0, 0, width, height
+        )
+
         return result
     }
 
