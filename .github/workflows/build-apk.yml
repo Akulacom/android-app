@@ -28,6 +28,17 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Bundle LaMa 512 INT8 model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 4 --retry-delay 3 \
+            -o app/src/main/assets/lama_512_int8.onnx \
+            "https://huggingface.co/g-ronimo/lama/resolve/8e20140b3ec5696f14ac3fac3b34b179ae4e1a15/lama_512_int8.onnx?download=true"
+          echo "cab19978adc306622fe37ef60d4a52103b99c98141d499c2a2366a7ed1255dbe  app/src/main/assets/lama_512_int8.onnx" | sha256sum -c -
+          ls -lh app/src/main/assets/lama_512_int8.onnx
+
       - name: Build debug APK
         id: build
         shell: bash
