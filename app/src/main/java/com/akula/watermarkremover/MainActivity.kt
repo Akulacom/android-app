@@ -26,6 +26,11 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Загружаем встроенную LaMa в память заранее. Пока пользователь выбирает
+        // и тречит видео, ONNX-сессия уже готовится. Повторно в этом процессе
+        // модель больше не поднимается.
+        NeuralInpainter.warmUp(applicationContext)
+
         binding.btnAddVideo.setOnClickListener {
             pickVideo.launch("video/*")
         }
