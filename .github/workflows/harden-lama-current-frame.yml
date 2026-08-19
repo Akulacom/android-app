@@ -1,0 +1,162 @@
+name: Harden current-frame LaMa
+
+on:
+  push:
+    paths:
+      - '.github/workflows/harden-lama-current-frame.yml'
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  harden-build-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Harden Bitmap ownership and audit pipeline
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt')
+          s = path.read_text(encoding='utf-8')
+
+          old_resized = '''        val resized = Bitmap.createScaledBitmap(
+              contextBitmap,
+              MODEL_INPUT_SIZE,
+              MODEL_INPUT_SIZE,
+              true
+          )
+          '''
+          new_resized = '''        // Android may return the source Bitmap when no scaling is required.
+          // Keep an independent object so recycle() cannot invalidate contextBitmap/source.
+          val resized = if (
+              contextBitmap.width == MODEL_INPUT_SIZE &&
+              contextBitmap.height == MODEL_INPUT_SIZE
+          ) {
+              contextBitmap.copy(Bitmap.Config.ARGB_8888, false)
+          } else {
+              Bitmap.createScaledBitmap(
+                  contextBitmap,
+                  MODEL_INPUT_SIZE,
+                  MODEL_INPUT_SIZE,
+                  true
+              )
+          }
+          '''
+
+          old_generated = '''        val generatedContext = Bitmap.createScaledBitmap(
+              generated512,
+              contextW,
+              contextH,
+              true
+          )
+          generated512.recycle()
+          '''
+          new_generated = '''        // Same ownership rule for model output: if context is exactly 512x512,
+          // createScaledBitmap may return generated512 itself.
+          val generatedContext = if (
+              generated512.width == contextW && generated512.height == contextH
+          ) {
+              generated512.copy(Bitmap.Config.ARGB_8888, false)
+          } else {
+              Bitmap.createScaledBitmap(
+                  generated512,
+                  contextW,
+                  contextH,
+                  true
+              )
+          }
+          generated512.recycle()
+          '''
+
+          if old_resized not in s:
+              raise SystemExit('Expected resized block not found; refusing blind patch')
+          if old_generated not in s:
+              raise SystemExit('Expected generatedContext block not found; refusing blind patch')
+
+          s = s.replace(old_resized, new_resized, 1)
+          s = s.replace(old_generated, new_generated, 1)
+
+          forbidden = [
+              'AnchorPatch',
+              'PatchOp',
+              'reusePreviousPatch',
+              'buildInterpolatedPatchOps',
+              'buildOverlayCommand',
+              'interpolatePatches'
+          ]
+          present = [name for name in forbidden if name in s]
+          if present:
+              raise SystemExit('Forbidden stale-frame pipeline remains: ' + ', '.join(present))
+
+          required = [
+              'lama_512_int8.onnx',
+              'for (index in frameFiles.indices)',
+              'inpaintCurrentFrame(',
+              'compositeGeneratedRegion(',
+              'longArrayOf(1, 4, height.toLong(), width.toLong())',
+              '"-framerate", fpsText',
+              'contextBitmap.copy(Bitmap.Config.ARGB_8888, false)',
+              'generated512.copy(Bitmap.Config.ARGB_8888, false)'
+          ]
+          missing = [name for name in required if name not in s]
+          if missing:
+              raise SystemExit('Required invariants missing: ' + ', '.join(missing))
+
+          # Fast structural sanity check before Gradle/Kotlin compiler.
+          pairs = [('(', ')'), ('{', '}'), ('[', ']')]
+          for left, right in pairs:
+              if s.count(left) != s.count(right):
+                  raise SystemExit(f'Unbalanced {left}{right}: {s.count(left)} != {s.count(right)}')
+
+          path.write_text(s, encoding='utf-8')
+          print('SOURCE AUDIT PASS')
+          print('No stale-frame interpolation/overlay symbols remain')
+          print('Bitmap ownership guards installed')
+          PY
+
+      - name: Build debug APK
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Commit only verified source
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/akula/watermarkremover/NeuralInpainter.kt
+          if ! git diff --cached --quiet; then
+            git commit -m "Harden LaMa current-frame bitmap ownership"
+            git push origin HEAD:main
+          fi
+
+      - name: Report result
+        if: always()
+        shell: bash
+        run: |
+          gh issue comment 1 --body "### LAMA CURRENT-FRAME HARDENING\nPatch: ${{ steps.patch.outcome }}\nBuild: ${{ steps.build.outcome }}\nSource: $GITHUB_SHA"
