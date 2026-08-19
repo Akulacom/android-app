@@ -5,35 +5,29 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Canvas
+import android.graphics.BitmapFactory
 import android.graphics.Color
-import android.graphics.Paint
 import android.graphics.RectF
-import android.media.MediaMetadataRetriever
-import android.os.Build
-import android.os.SystemClock
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
 import java.nio.FloatBuffer
 import java.util.Locale
-import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Быстрый качественный режим удаления watermark.
+ * Качественный LaMa-режим для видео.
  *
- * Главное отличие от старого режима:
- * - видео НЕ разбирается на сотни PNG;
- * - LaMa НЕ запускается на каждом кадре;
- * - используется встроенная фиксированная LaMa 512 INT8;
- * - скорость первого inference измеряется на самом телефоне;
- * - количество AI-якорей автоматически подбирается под временной бюджет;
- * - между AI-якорями создаются промежуточные чистые patch-и интерполяцией;
- * - нейросеть получает только локальный контекст вокруг watermark, поэтому
- *   лишняя полноэкранная постобработка больше не съедает память и время.
+ * Принципиально НЕ переносит и НЕ интерполирует готовый фон между кадрами.
+ * Каждый кадр, где watermark активен, обрабатывается независимо на основе
+ * пикселей именно этого кадра. Поэтому движущийся фон не превращается в
+ * прямоугольные "заплатки" из старого кадра.
+ *
+ * Для скорости используется фиксированная LaMa 512 INT8. Нейросеть получает
+ * только квадрат локального контекста вокруг текущей маски, но запускается
+ * для каждого активного видеокадра. Неактивные кадры копируются без декода.
  */
 object NeuralInpainter {
 
@@ -43,33 +37,9 @@ object NeuralInpainter {
         fun onError(message: String)
     }
 
-    private data class PatchOp(
-        val startMs: Long,
-        val endMs: Long,
-        val rect: RectF,
-        val file: File
-    )
-
-    private data class AnchorPatch(
-        val keyIndex: Int,
-        val timeMs: Long,
-        val trackId: Int,
-        val bitmap: Bitmap
-    )
-
     private const val MODEL_ASSET = "lama_512_int8.onnx"
     private const val MODEL_INPUT_SIZE = 512
     private const val INPUT_NAME = "input"
-
-    // Модель всё равно получает 512x512. Декодировать 4K-кадр целиком для
-    // одного маленького watermark бессмысленно, поэтому ограничиваем preview.
-    private const val MAX_DECODE_SIDE = 1280
-
-    // Для короткого ролика оставляем примерно 30-35 секунд на сами AI-вызовы,
-    // остальное — получение кадров, подготовка patch-ей и финальный encode.
-    private const val SHORT_AI_BUDGET_MS = 32_000L
-    private const val MEDIUM_AI_BUDGET_MS = 40_000L
-    private const val LONG_AI_BUDGET_MS = 50_000L
 
     private val ortEnv: OrtEnvironment by lazy {
         OrtEnvironment.getEnvironment()
@@ -81,8 +51,8 @@ object NeuralInpainter {
     private var cachedSession: OrtSession? = null
 
     /**
-     * Загружаем 60-МБ модель заранее, пока пользователь выбирает и тречит видео.
-     * Поэтому загрузка модели не должна попадать в основное время обработки.
+     * Загружает модель заранее, чтобы создание ORT-сессии не добавляло задержку
+     * после нажатия "Применить".
      */
     fun warmUp(context: Context) {
         if (cachedSession != null) return
@@ -90,7 +60,7 @@ object NeuralInpainter {
             try {
                 getSession(context.applicationContext)
             } catch (_: Throwable) {
-                // Основной process покажет точную ошибку, если модель не загрузится.
+                // process() покажет пользователю точную ошибку, если модель недоступна.
             }
         }.start()
     }
@@ -127,671 +97,280 @@ object NeuralInpainter {
         videoDurationMs: Long,
         callback: Callback
     ) {
-        val sorted = keyframes.sortedBy { it.timeMs }
-        if (sorted.isEmpty()) {
+        val sortedKeyframes = keyframes.sortedBy { it.timeMs }
+        if (sortedKeyframes.isEmpty()) {
             callback.onError("Нет точек трекинга watermark")
             return
         }
 
-        val activeIndexes = sorted.indices.filter { index ->
-            val k = sorted[index]
-            k.active && k.rect.width() >= 2f && k.rect.height() >= 2f
-        }
-
-        if (activeIndexes.isEmpty()) {
-            callback.onProgress(85, "Watermark не найден — копирование видео")
-            val copy = FFmpegKit.executeWithArguments(
-                arrayOf("-y", "-i", inputPath, "-c", "copy", outputPath)
-            )
-            if (ReturnCode.isSuccess(copy.returnCode)) {
-                callback.onProgress(100, "Готово")
-                callback.onSuccess(outputPath)
-            } else {
-                callback.onError("Не удалось сохранить видео: ${copy.returnCode}")
-            }
+        val inputFile = File(inputPath)
+        if (!inputFile.exists() || inputFile.length() <= 0L) {
+            callback.onError("Исходное видео не найдено")
             return
         }
 
-        callback.onProgress(2, "LaMa INT8 готовится")
-        val session = getSession(context)
-
-        val workDir = File(context.cacheDir, "lama_fast_${System.currentTimeMillis()}")
-            .apply { mkdirs() }
-
-        val retriever = MediaMetadataRetriever()
-        val anchors = ArrayList<AnchorPatch>()
+        val durationMs = videoDurationMs.coerceAtLeast(1L)
+        val workDir = File(context.cacheDir, "lama_frames_${System.currentTimeMillis()}")
+        val framesDir = File(workDir, "frames")
+        val outFramesDir = File(workDir, "frames_out")
+        framesDir.mkdirs()
+        outFramesDir.mkdirs()
 
         try {
-            retriever.setDataSource(inputPath)
+            callback.onProgress(2, "Подготовка LaMa INT8")
+            val session = getSession(context)
 
-            val metadataW = retriever.extractMetadata(
-                MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
-            )?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-
-            val metadataH = retriever.extractMetadata(
-                MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
-            )?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-
-            val durationMs = videoDurationMs.coerceAtLeast(1L)
-            val decodeSize = calculateDecodeSize(metadataW, metadataH)
-
-            // Первый AI-якорь нужен и для результата, и как реальный benchmark
-            // конкретного телефона. После него выбираем число остальных якорей.
-            val firstIndex = activeIndexes.first()
-            callback.onProgress(4, "Измерение скорости LaMa")
-
-            val firstStart = SystemClock.elapsedRealtime()
-            val firstAnchor = createAnchorPatch(
-                retriever = retriever,
-                session = session,
-                keyIndex = firstIndex,
-                key = sorted[firstIndex],
-                metadataW = metadataW,
-                metadataH = metadataH,
-                decodeW = decodeSize.first,
-                decodeH = decodeSize.second,
-                durationMs = durationMs
-            ) ?: run {
-                callback.onError("Не удалось получить первый кадр для LaMa")
+            callback.onProgress(4, "Извлечение кадров")
+            val extractArgs = arrayOf(
+                "-y",
+                "-i", inputPath,
+                "-fps_mode", "passthrough",
+                "${framesDir.absolutePath}/frame_%06d.png"
+            )
+            val extract = FFmpegKit.executeWithArguments(extractArgs)
+            if (!ReturnCode.isSuccess(extract.returnCode)) {
+                val tail = extract.allLogsAsString
+                    ?.lines()
+                    ?.takeLast(30)
+                    ?.joinToString("\n")
+                    .orEmpty()
+                callback.onError(
+                    "Не удалось извлечь кадры: ${extract.returnCode}\n$tail"
+                )
                 return
             }
-            val firstInferenceMs =
-                (SystemClock.elapsedRealtime() - firstStart).coerceAtLeast(1L)
-            anchors.add(firstAnchor)
 
-            val selectedAnchorIndexes = chooseAnchorIndexes(
-                sorted = sorted,
-                activeIndexes = activeIndexes,
-                durationMs = durationMs,
-                measuredAnchorMs = firstInferenceMs
-            )
+            val frameFiles = framesDir
+                .listFiles { file -> file.isFile && file.name.endsWith(".png") }
+                ?.sortedBy { it.name }
+                ?: emptyList()
 
-            val totalAi = selectedAnchorIndexes.size.coerceAtLeast(1)
-            val secondsPerAnchor = firstInferenceMs / 1000.0
-            callback.onProgress(
-                8,
-                "LaMa: ${String.format(Locale.US, "%.1f", secondsPerAnchor)}с/AI • план $totalAi точек"
-            )
+            if (frameFiles.isEmpty()) {
+                callback.onError("FFmpeg не извлёк ни одного кадра")
+                return
+            }
 
-            selectedAnchorIndexes.forEachIndexed { selectedPosition, keyIndex ->
-                if (keyIndex == firstIndex) return@forEachIndexed
+            val totalFrames = frameFiles.size
+            val masks = ArrayList<RectF>(totalFrames)
+            var activeFrames = 0
 
-                val anchor = createAnchorPatch(
-                    retriever = retriever,
-                    session = session,
-                    keyIndex = keyIndex,
-                    key = sorted[keyIndex],
-                    metadataW = metadataW,
-                    metadataH = metadataH,
-                    decodeW = decodeSize.first,
-                    decodeH = decodeSize.second,
-                    durationMs = durationMs
-                ) ?: return@forEachIndexed
+            for (index in 0 until totalFrames) {
+                val timeMs = frameTimeMs(index, totalFrames, durationMs)
+                val mask = maskAtTime(sortedKeyframes, timeMs)
+                masks.add(mask)
+                if (isActiveMask(mask)) activeFrames++
+            }
 
-                anchors.add(anchor)
+            if (activeFrames == 0) {
+                callback.onProgress(90, "Watermark не найден — копирование видео")
+                val copy = FFmpegKit.executeWithArguments(
+                    arrayOf("-y", "-i", inputPath, "-c", "copy", outputPath)
+                )
+                if (ReturnCode.isSuccess(copy.returnCode)) {
+                    callback.onProgress(100, "Готово")
+                    callback.onSuccess(outputPath)
+                } else {
+                    callback.onError("Не удалось сохранить видео: ${copy.returnCode}")
+                }
+                return
+            }
 
-                val done = anchors.size.coerceAtMost(totalAi)
-                val percent = 8 + (done * 52 / totalAi)
+            var aiDone = 0
+            for (index in frameFiles.indices) {
+                val sourceFile = frameFiles[index]
+                val outputFile = File(outFramesDir, sourceFile.name)
+                val mask = masks[index]
+
+                if (!isActiveMask(mask)) {
+                    sourceFile.copyTo(outputFile, overwrite = true)
+                } else {
+                    val sourceBitmap = BitmapFactory.decodeFile(sourceFile.absolutePath)
+                        ?: throw IllegalStateException(
+                            "Не удалось открыть кадр ${index + 1}/$totalFrames"
+                        )
+
+                    val resultBitmap = try {
+                        inpaintCurrentFrame(
+                            env = ortEnv,
+                            session = session,
+                            source = sourceBitmap,
+                            rawMask = mask
+                        )
+                    } finally {
+                        if (!sourceBitmap.isRecycled) sourceBitmap.recycle()
+                    }
+
+                    try {
+                        outputFile.outputStream().use { output ->
+                            if (!resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                                throw IllegalStateException(
+                                    "Не удалось сохранить кадр ${index + 1}/$totalFrames"
+                                )
+                            }
+                        }
+                    } finally {
+                        if (!resultBitmap.isRecycled) resultBitmap.recycle()
+                    }
+
+                    aiDone++
+                }
+
+                val percent = 7 + ((index + 1) * 83 / totalFrames)
                 callback.onProgress(
-                    percent.coerceIn(8, 60),
-                    "LaMa AI: $done/$totalAi"
+                    percent.coerceIn(7, 90),
+                    "LaMa INT8: $aiDone/$activeFrames AI • кадр ${index + 1}/$totalFrames"
                 )
             }
 
-            anchors.sortBy { it.timeMs }
-            if (anchors.isEmpty()) {
-                callback.onError("LaMa не создала ни одного чистого patch")
-                return
-            }
+            val fps = totalFrames * 1000.0 / durationMs.toDouble()
+            callback.onProgress(92, "Сборка видео ${String.format(Locale.US, "%.3f", fps)} fps")
 
-            callback.onProgress(64, "Интерполяция чистого фона")
-            val ops = buildInterpolatedPatchOps(
-                sorted = sorted,
-                activeIndexes = activeIndexes,
-                anchors = anchors,
-                metadataW = metadataW,
-                metadataH = metadataH,
-                durationMs = durationMs,
-                workDir = workDir,
-                callback = callback
-            )
-
-            if (ops.isEmpty()) {
-                callback.onError("Не удалось построить AI patch-и")
-                return
-            }
-
-            callback.onProgress(82, "Быстрая сборка видео")
-            val ffmpegArgs = buildOverlayCommand(
+            val assembled = assembleVideo(
+                framePattern = "${outFramesDir.absolutePath}/frame_%06d.png",
                 inputPath = inputPath,
                 outputPath = outputPath,
-                ops = ops
+                fps = fps
             )
 
-            val sessionResult = FFmpegKit.executeWithArguments(ffmpegArgs)
-            if (ReturnCode.isSuccess(sessionResult.returnCode)) {
+            if (assembled.first) {
                 val output = File(outputPath)
                 if (output.exists() && output.length() > 0L) {
                     callback.onProgress(100, "Готово")
                     callback.onSuccess(outputPath)
                 } else {
-                    callback.onError("FFmpeg завершился без готового файла")
+                    callback.onError("Сборка завершилась без итогового файла")
                 }
             } else {
-                val logs = sessionResult.allLogsAsString ?: ""
-                val tail = logs.lines().takeLast(35).joinToString("\n")
-                callback.onError(
-                    "Сборка LaMa-video: ${sessionResult.returnCode}\n$tail"
-                )
+                callback.onError("Не удалось собрать видео\n${assembled.second}")
             }
         } finally {
-            anchors.forEach { anchor ->
-                try {
-                    if (!anchor.bitmap.isRecycled) anchor.bitmap.recycle()
-                } catch (_: Throwable) {
-                }
-            }
-            try { retriever.release() } catch (_: Throwable) {}
             workDir.deleteRecursively()
         }
     }
 
     /**
-     * Количество настоящих запусков LaMa зависит от скорости телефона.
-     * На быстром устройстве точек больше, на медленном — меньше.
-     * Это намного стабильнее фиксированного "каждый N-й кадр".
+     * Первый проход сохраняет аудио без перекодирования. Если конкретный аудио-
+     * кодек нельзя положить в MP4 через copy, повторяем с AAC вместо падения.
      */
-    private fun chooseAnchorIndexes(
-        sorted: List<MaskKeyframe>,
-        activeIndexes: List<Int>,
-        durationMs: Long,
-        measuredAnchorMs: Long
-    ): List<Int> {
-        if (activeIndexes.size <= 2) return activeIndexes
-
-        val budgetMs = when {
-            durationMs <= 20_000L -> SHORT_AI_BUDGET_MS
-            durationMs <= 40_000L -> MEDIUM_AI_BUDGET_MS
-            else -> LONG_AI_BUDGET_MS
-        }
-
-        val safeMeasured = measuredAnchorMs.coerceAtLeast(350L)
-        val byPhoneSpeed = (budgetMs / safeMeasured)
-            .toInt()
-            .coerceIn(3, 24)
-
-        // Даже на очень быстром телефоне нет смысла запускать LaMa десятки раз
-        // в секунду: промежуточный фон строится из соседних AI-якорей.
-        val byDuration = (ceil(durationMs / 1_100.0).toInt() + 1)
-            .coerceIn(3, 24)
-
-        val totalLimit = min(activeIndexes.size, min(byPhoneSpeed, byDuration))
-            .coerceAtLeast(1)
-
-        val runs = splitActiveRuns(sorted, activeIndexes)
-        if (runs.size == 1) {
-            return evenlySelect(runs.first(), totalLimit)
-        }
-
-        val result = LinkedHashSet<Int>()
-        var remaining = totalLimit
-        var remainingItems = activeIndexes.size
-
-        runs.forEachIndexed { runIndex, run ->
-            val runsLeft = runs.size - runIndex
-            val minimumForRest = (runsLeft - 1).coerceAtLeast(0)
-            val proportional = if (remainingItems > 0) {
-                (remaining.toFloat() * run.size / remainingItems).roundToInt()
-            } else {
-                1
-            }
-            val quota = proportional
-                .coerceAtLeast(1)
-                .coerceAtMost((remaining - minimumForRest).coerceAtLeast(1))
-                .coerceAtMost(run.size)
-
-            result.addAll(evenlySelect(run, quota))
-            remaining -= quota
-            remainingItems -= run.size
-        }
-
-        // Если округления оставили свободные точки, добавляем их равномерно.
-        if (result.size < totalLimit) {
-            val leftovers = activeIndexes.filter { it !in result }
-            result.addAll(evenlySelect(leftovers, totalLimit - result.size))
-        }
-
-        return result.sortedBy { sorted[it].timeMs }
-    }
-
-    private fun splitActiveRuns(
-        sorted: List<MaskKeyframe>,
-        activeIndexes: List<Int>
-    ): List<List<Int>> {
-        if (activeIndexes.isEmpty()) return emptyList()
-
-        val runs = ArrayList<MutableList<Int>>()
-        var current = mutableListOf(activeIndexes.first())
-        runs.add(current)
-
-        for (position in 1 until activeIndexes.size) {
-            val previousIndex = activeIndexes[position - 1]
-            val currentIndex = activeIndexes[position]
-            val previous = sorted[previousIndex]
-            val item = sorted[currentIndex]
-
-            val sameRun =
-                currentIndex == previousIndex + 1 &&
-                    previous.active && item.active &&
-                    previous.trackId == item.trackId &&
-                    item.timeMs - previous.timeMs <= 1_500L
-
-            if (sameRun) {
-                current.add(currentIndex)
-            } else {
-                current = mutableListOf(currentIndex)
-                runs.add(current)
-            }
-        }
-
-        return runs
-    }
-
-    private fun evenlySelect(source: List<Int>, count: Int): List<Int> {
-        if (source.isEmpty() || count <= 0) return emptyList()
-        if (count >= source.size) return source
-        if (count == 1) return listOf(source[source.size / 2])
-
-        val result = LinkedHashSet<Int>()
-        for (i in 0 until count) {
-            val position =
-                (i.toDouble() * (source.size - 1).toDouble() / (count - 1).toDouble())
-                    .roundToInt()
-                    .coerceIn(0, source.lastIndex)
-            result.add(source[position])
-        }
-
-        // Из-за округления теоретически может получиться на один элемент меньше.
-        if (result.size < count) {
-            source.forEach { item ->
-                if (result.size < count) result.add(item)
-            }
-        }
-        return result.toList()
-    }
-
-    private fun createAnchorPatch(
-        retriever: MediaMetadataRetriever,
-        session: OrtSession,
-        keyIndex: Int,
-        key: MaskKeyframe,
-        metadataW: Int,
-        metadataH: Int,
-        decodeW: Int,
-        decodeH: Int,
-        durationMs: Long
-    ): AnchorPatch? {
-        val frame = getPreviewFrame(
-            retriever = retriever,
-            timeMs = key.timeMs.coerceIn(0L, durationMs),
-            width = decodeW,
-            height = decodeH
-        ) ?: return null
-
-        try {
-            val frameMask = scaleRect(
-                key.rect,
-                metadataW,
-                metadataH,
-                frame.width,
-                frame.height
-            )
-
-            val decodedPatch = inpaintPatch(
-                env = ortEnv,
-                session = session,
-                srcBitmap = frame,
-                rawMaskRect = frameMask
-            )
-
-            val targetRect = expandedMask(key.rect, metadataW, metadataH)
-            val targetW = targetRect.width().toInt().coerceAtLeast(2)
-            val targetH = targetRect.height().toInt().coerceAtLeast(2)
-
-            val scaledPatch = if (
-                decodedPatch.width != targetW || decodedPatch.height != targetH
-            ) {
-                Bitmap.createScaledBitmap(decodedPatch, targetW, targetH, true).also {
-                    decodedPatch.recycle()
-                }
-            } else {
-                decodedPatch
-            }
-
-            return AnchorPatch(
-                keyIndex = keyIndex,
-                timeMs = key.timeMs,
-                trackId = key.trackId,
-                bitmap = scaledPatch
-            )
-        } finally {
-            frame.recycle()
-        }
-    }
-
-    private fun calculateDecodeSize(width: Int, height: Int): Pair<Int, Int> {
-        val maxSide = max(width, height)
-        if (maxSide <= MAX_DECODE_SIDE) return width to height
-
-        val scale = MAX_DECODE_SIDE.toFloat() / maxSide.toFloat()
-        return (
-            (width * scale).roundToInt().coerceAtLeast(2)
-            ) to (
-            (height * scale).roundToInt().coerceAtLeast(2)
-            )
-    }
-
-    private fun getPreviewFrame(
-        retriever: MediaMetadataRetriever,
-        timeMs: Long,
-        width: Int,
-        height: Int
-    ): Bitmap? {
-        val timeUs = timeMs * 1000L
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            try {
-                retriever.getScaledFrameAtTime(
-                    timeUs,
-                    MediaMetadataRetriever.OPTION_CLOSEST,
-                    width.coerceAtLeast(2),
-                    height.coerceAtLeast(2)
-                ) ?: retriever.getFrameAtTime(
-                    timeUs,
-                    MediaMetadataRetriever.OPTION_CLOSEST
-                )
-            } catch (_: Throwable) {
-                retriever.getFrameAtTime(
-                    timeUs,
-                    MediaMetadataRetriever.OPTION_CLOSEST
-                )
-            }
-        } else {
-            retriever.getFrameAtTime(
-                timeUs,
-                MediaMetadataRetriever.OPTION_CLOSEST
-            )
-        }
-    }
-
-    private fun buildInterpolatedPatchOps(
-        sorted: List<MaskKeyframe>,
-        activeIndexes: List<Int>,
-        anchors: List<AnchorPatch>,
-        metadataW: Int,
-        metadataH: Int,
-        durationMs: Long,
-        workDir: File,
-        callback: Callback
-    ): List<PatchOp> {
-        val result = ArrayList<PatchOp>()
-
-        activeIndexes.forEachIndexed { position, keyIndex ->
-            val key = sorted[keyIndex]
-            val targetRect = expandedMask(key.rect, metadataW, metadataH)
-            val targetW = targetRect.width().toInt().coerceAtLeast(2)
-            val targetH = targetRect.height().toInt().coerceAtLeast(2)
-
-            val sameTrackAnchors = anchors.filter { it.trackId == key.trackId }
-            val usableAnchors = if (sameTrackAnchors.isNotEmpty()) {
-                sameTrackAnchors
-            } else {
-                anchors
-            }
-
-            val previous = usableAnchors
-                .filter { it.timeMs <= key.timeMs }
-                .maxByOrNull { it.timeMs }
-                ?: usableAnchors.first()
-
-            val next = usableAnchors
-                .filter { it.timeMs >= key.timeMs }
-                .minByOrNull { it.timeMs }
-                ?: usableAnchors.last()
-
-            val patch = interpolateAnchorPatches(
-                previous = previous,
-                next = next,
-                targetTimeMs = key.timeMs,
-                targetW = targetW,
-                targetH = targetH
-            )
-
-            try {
-                val patchFile = File(
-                    workDir,
-                    "patch_${position.toString().padStart(3, '0')}.png"
-                )
-                patchFile.outputStream().use { out ->
-                    if (!patch.compress(Bitmap.CompressFormat.PNG, 100, out)) {
-                        throw IllegalStateException("Не удалось сохранить AI patch")
-                    }
-                }
-
-                val startMs = if (keyIndex == 0) {
-                    0L
-                } else {
-                    midpoint(sorted[keyIndex - 1].timeMs, key.timeMs)
-                }.coerceIn(0L, durationMs)
-
-                val endCandidate = if (keyIndex == sorted.lastIndex) {
-                    durationMs
-                } else {
-                    midpoint(key.timeMs, sorted[keyIndex + 1].timeMs)
-                }
-                val endMs = endCandidate
-                    .coerceAtLeast(startMs + 1L)
-                    .coerceAtMost(durationMs)
-
-                result.add(
-                    PatchOp(
-                        startMs = startMs,
-                        endMs = endMs,
-                        rect = targetRect,
-                        file = patchFile
-                    )
-                )
-            } finally {
-                patch.recycle()
-            }
-
-            val done = position + 1
-            val percent = 64 + (done * 14 / activeIndexes.size.coerceAtLeast(1))
-            callback.onProgress(
-                percent.coerceIn(64, 78),
-                "Фон: $done/${activeIndexes.size}"
-            )
-        }
-
-        return result
-    }
-
-    private fun interpolateAnchorPatches(
-        previous: AnchorPatch,
-        next: AnchorPatch,
-        targetTimeMs: Long,
-        targetW: Int,
-        targetH: Int
-    ): Bitmap {
-        val prev = if (
-            previous.bitmap.width == targetW && previous.bitmap.height == targetH
-        ) {
-            previous.bitmap
-        } else {
-            Bitmap.createScaledBitmap(previous.bitmap, targetW, targetH, true)
-        }
-
-        if (previous === next || next.timeMs <= previous.timeMs) {
-            return prev.copy(Bitmap.Config.ARGB_8888, true).also {
-                if (prev !== previous.bitmap) prev.recycle()
-            }
-        }
-
-        val nxt = if (
-            next.bitmap.width == targetW && next.bitmap.height == targetH
-        ) {
-            next.bitmap
-        } else {
-            Bitmap.createScaledBitmap(next.bitmap, targetW, targetH, true)
-        }
-
-        val alpha = (
-            (targetTimeMs - previous.timeMs).toFloat() /
-                (next.timeMs - previous.timeMs).toFloat()
-            ).coerceIn(0f, 1f)
-
-        val size = targetW * targetH
-        val prevPixels = IntArray(size)
-        val nextPixels = IntArray(size)
-        val outPixels = IntArray(size)
-
-        prev.getPixels(prevPixels, 0, targetW, 0, 0, targetW, targetH)
-        nxt.getPixels(nextPixels, 0, targetW, 0, 0, targetW, targetH)
-
-        for (i in 0 until size) {
-            outPixels[i] = blend(prevPixels[i], nextPixels[i], alpha)
-        }
-
-        if (prev !== previous.bitmap) prev.recycle()
-        if (nxt !== next.bitmap) nxt.recycle()
-
-        return Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888).also {
-            it.setPixels(outPixels, 0, targetW, 0, 0, targetW, targetH)
-        }
-    }
-
-    private fun getSession(context: Context): OrtSession {
-        cachedSession?.let { return it }
-
-        synchronized(sessionLock) {
-            cachedSession?.let { return it }
-
-            val assetNames = context.assets.list("") ?: emptyArray()
-            if (MODEL_ASSET !in assetNames) {
-                throw IllegalStateException(
-                    "В APK нет $MODEL_ASSET. Нужна сборка со встроенной LaMa."
-                )
-            }
-
-            val modelBytes = context.assets.open(MODEL_ASSET).use { it.readBytes() }
-            val session = ortEnv.createSession(modelBytes)
-            cachedSession = session
-            return session
-        }
-    }
-
-    private fun buildOverlayCommand(
+    private fun assembleVideo(
+        framePattern: String,
         inputPath: String,
         outputPath: String,
-        ops: List<PatchOp>
-    ): Array<String> {
-        val args = mutableListOf("-y", "-i", inputPath)
-        ops.forEach { op ->
-            args.add("-i")
-            args.add(op.file.absolutePath)
-        }
+        fps: Double
+    ): Pair<Boolean, String> {
+        val fpsText = String.format(Locale.US, "%.6f", fps.coerceIn(1.0, 240.0))
 
-        val filters = ArrayList<String>()
-        filters.add("[0:v]setpts=PTS-STARTPTS[v0]")
-
-        ops.forEachIndexed { index, op ->
-            val patchInput = index + 1
-            val inLabel = "v$index"
-            val outLabel = "v${index + 1}"
-            val patchLabel = "p$index"
-
-            val x = op.rect.left.toInt().coerceAtLeast(0)
-            val y = op.rect.top.toInt().coerceAtLeast(0)
-            val t0 = String.format(Locale.US, "%.3f", op.startMs / 1000.0)
-            val t1 = String.format(Locale.US, "%.3f", op.endMs / 1000.0)
-
-            filters.add("[$patchInput:v]format=rgba[$patchLabel]")
-            filters.add(
-                "[$inLabel][$patchLabel]overlay=" +
-                    "x=$x:y=$y:" +
-                    "enable='between(t,$t0,$t1)':" +
-                    "eof_action=repeat:repeatlast=1[$outLabel]"
-            )
-        }
-
-        args.addAll(
-            listOf(
-                "-filter_complex", filters.joinToString(";"),
-                "-map", "[v${ops.size}]",
-                "-map", "0:a:0?",
+        fun args(audioCopy: Boolean): Array<String> {
+            val list = mutableListOf(
+                "-y",
+                "-framerate", fpsText,
+                "-i", framePattern,
+                "-i", inputPath,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "veryfast",
                 "-crf", "18",
                 "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                "-c:a", "copy",
-                outputPath
+                "-movflags", "+faststart"
             )
-        )
+            if (audioCopy) {
+                list.addAll(listOf("-c:a", "copy"))
+            } else {
+                list.addAll(listOf("-c:a", "aac", "-b:a", "192k"))
+            }
+            list.addAll(listOf("-shortest", outputPath))
+            return list.toTypedArray()
+        }
 
-        return args.toTypedArray()
-    }
+        val first = FFmpegKit.executeWithArguments(args(audioCopy = true))
+        if (ReturnCode.isSuccess(first.returnCode)) return true to ""
 
-    private fun midpoint(a: Long, b: Long): Long {
-        return a + (b - a) / 2L
-    }
+        try { File(outputPath).delete() } catch (_: Throwable) {}
 
-    private fun scaleRect(
-        rect: RectF,
-        sourceW: Int,
-        sourceH: Int,
-        targetW: Int,
-        targetH: Int
-    ): RectF {
-        val sx = targetW.toFloat() / sourceW.toFloat().coerceAtLeast(1f)
-        val sy = targetH.toFloat() / sourceH.toFloat().coerceAtLeast(1f)
-        return RectF(
-            rect.left * sx,
-            rect.top * sy,
-            rect.right * sx,
-            rect.bottom * sy
-        )
+        val second = FFmpegKit.executeWithArguments(args(audioCopy = false))
+        if (ReturnCode.isSuccess(second.returnCode)) return true to ""
+
+        val tail = second.allLogsAsString
+            ?.lines()
+            ?.takeLast(35)
+            ?.joinToString("\n")
+            .orEmpty()
+        return false to "FFmpeg ${second.returnCode}\n$tail"
     }
 
     /**
-     * LaMa получает квадрат локального контекста вокруг watermark.
-     * После inference возвращаем только маленький очищенный patch, а не
-     * полноразмерный кадр. Сама нейросеть всё ещё работает на 512x512,
-     * поэтому качество модели не урезается.
+     * Возвращает маску ближайшего состояния трекера без повторной сортировки
+     * списка для каждого из сотен кадров.
      */
-    private fun inpaintPatch(
-        env: OrtEnvironment,
-        session: OrtSession,
-        srcBitmap: Bitmap,
-        rawMaskRect: RectF
-    ): Bitmap {
-        val frameW = srcBitmap.width
-        val frameH = srcBitmap.height
-        if (frameW <= 1 || frameH <= 1) {
-            return srcBitmap.copy(Bitmap.Config.ARGB_8888, true)
+    private fun maskAtTime(sorted: List<MaskKeyframe>, timeMs: Long): RectF {
+        if (sorted.isEmpty()) return RectF()
+        if (sorted.size == 1) {
+            val only = sorted[0]
+            return if (only.active) RectF(only.rect) else RectF()
+        }
+        if (timeMs <= sorted.first().timeMs) {
+            val first = sorted.first()
+            return if (first.active) RectF(first.rect) else RectF()
+        }
+        if (timeMs >= sorted.last().timeMs) {
+            val last = sorted.last()
+            return if (last.active) RectF(last.rect) else RectF()
         }
 
-        val targetRect = expandedMask(rawMaskRect, frameW, frameH)
-        val contextRect = buildContextRect(targetRect, frameW, frameH)
+        var best = sorted.first()
+        var bestDistance = kotlin.math.abs(best.timeMs - timeMs)
+        for (item in sorted) {
+            val distance = kotlin.math.abs(item.timeMs - timeMs)
+            if (distance < bestDistance) {
+                best = item
+                bestDistance = distance
+            }
+        }
 
-        val contextLeft = contextRect.left.toInt().coerceIn(0, frameW - 1)
-        val contextTop = contextRect.top.toInt().coerceIn(0, frameH - 1)
-        val contextRight = contextRect.right.toInt().coerceIn(contextLeft + 1, frameW)
-        val contextBottom = contextRect.bottom.toInt().coerceIn(contextTop + 1, frameH)
+        return if (best.active) RectF(best.rect) else RectF()
+    }
+
+    private fun frameTimeMs(index: Int, totalFrames: Int, durationMs: Long): Long {
+        return if (totalFrames > 1) {
+            index.toLong() * durationMs / (totalFrames - 1).toLong()
+        } else {
+            0L
+        }
+    }
+
+    private fun isActiveMask(mask: RectF): Boolean {
+        return mask.width() >= 2f && mask.height() >= 2f
+    }
+
+    /**
+     * Обрабатывает текущий видеокадр независимо от соседних кадров.
+     * Вне expandedMask результат остаётся пиксельно исходным Bitmap-кадру.
+     */
+    private fun inpaintCurrentFrame(
+        env: OrtEnvironment,
+        session: OrtSession,
+        source: Bitmap,
+        rawMask: RectF
+    ): Bitmap {
+        val frameW = source.width
+        val frameH = source.height
+        if (frameW <= 2 || frameH <= 2) {
+            return source.copy(Bitmap.Config.ARGB_8888, true)
+        }
+
+        val target = expandedMask(rawMask, frameW, frameH)
+        val context = buildContextRect(target, frameW, frameH)
+
+        val contextLeft = context.left.roundToInt().coerceIn(0, frameW - 2)
+        val contextTop = context.top.roundToInt().coerceIn(0, frameH - 2)
+        val contextRight = context.right.roundToInt().coerceIn(contextLeft + 2, frameW)
+        val contextBottom = context.bottom.roundToInt().coerceIn(contextTop + 2, frameH)
         val contextW = contextRight - contextLeft
         val contextH = contextBottom - contextTop
 
         val contextBitmap = Bitmap.createBitmap(
-            srcBitmap,
+            source,
             contextLeft,
             contextTop,
             contextW,
@@ -805,42 +384,27 @@ object NeuralInpainter {
             true
         )
 
-        val maskBitmap = Bitmap.createBitmap(
-            MODEL_INPUT_SIZE,
-            MODEL_INPUT_SIZE,
-            Bitmap.Config.ARGB_8888
-        )
-        val canvas = Canvas(maskBitmap)
-        canvas.drawColor(Color.BLACK)
-        val paint = Paint().apply {
-            color = Color.WHITE
-            isAntiAlias = false
-            style = Paint.Style.FILL
-        }
-
         val relativeMask = RectF(
-            targetRect.left - contextLeft,
-            targetRect.top - contextTop,
-            targetRect.right - contextLeft,
-            targetRect.bottom - contextTop
-        )
-        val scaleX = MODEL_INPUT_SIZE / contextW.toFloat()
-        val scaleY = MODEL_INPUT_SIZE / contextH.toFloat()
-        canvas.drawRect(
-            relativeMask.left * scaleX,
-            relativeMask.top * scaleY,
-            relativeMask.right * scaleX,
-            relativeMask.bottom * scaleY,
-            paint
+            target.left - contextLeft,
+            target.top - contextTop,
+            target.right - contextLeft,
+            target.bottom - contextTop
         )
 
-        val inputTensor = combinedInputTensor(env, resized, maskBitmap)
-        val output512: Bitmap
+        val mask512 = RectF(
+            relativeMask.left * MODEL_INPUT_SIZE / contextW.toFloat(),
+            relativeMask.top * MODEL_INPUT_SIZE / contextH.toFloat(),
+            relativeMask.right * MODEL_INPUT_SIZE / contextW.toFloat(),
+            relativeMask.bottom * MODEL_INPUT_SIZE / contextH.toFloat()
+        )
+
+        val inputTensor = combinedInputTensor(env, resized, mask512)
+        val generated512: Bitmap
 
         try {
             session.run(mapOf(INPUT_NAME to inputTensor)).use { result ->
                 val outputTensor = result[0] as OnnxTensor
-                output512 = tensorToBitmap(
+                generated512 = tensorToBitmap(
                     outputTensor,
                     MODEL_INPUT_SIZE,
                     MODEL_INPUT_SIZE
@@ -849,61 +413,130 @@ object NeuralInpainter {
         } finally {
             inputTensor.close()
             resized.recycle()
-            maskBitmap.recycle()
         }
 
         val generatedContext = Bitmap.createScaledBitmap(
-            output512,
+            generated512,
             contextW,
             contextH,
             true
         )
-        output512.recycle()
+        generated512.recycle()
 
-        val targetLeft = (targetRect.left - contextLeft)
-            .toInt()
-            .coerceIn(0, contextW - 1)
-        val targetTop = (targetRect.top - contextTop)
-            .toInt()
-            .coerceIn(0, contextH - 1)
-        val targetRight = (targetRect.right - contextLeft)
-            .toInt()
-            .coerceIn(targetLeft + 1, contextW)
-        val targetBottom = (targetRect.bottom - contextTop)
-            .toInt()
-            .coerceIn(targetTop + 1, contextH)
-        val patchW = targetRight - targetLeft
-        val patchH = targetBottom - targetTop
+        val output = source.copy(Bitmap.Config.ARGB_8888, true)
 
-        val generatedPatch = Bitmap.createBitmap(
-            generatedContext,
-            targetLeft,
-            targetTop,
-            patchW,
-            patchH
-        )
-        val originalPatch = Bitmap.createBitmap(
-            contextBitmap,
-            targetLeft,
-            targetTop,
-            patchW,
-            patchH
-        )
+        try {
+            compositeGeneratedRegion(
+                output = output,
+                generatedContext = generatedContext,
+                target = target,
+                contextLeft = contextLeft,
+                contextTop = contextTop
+            )
+        } finally {
+            generatedContext.recycle()
+            contextBitmap.recycle()
+        }
 
-        generatedContext.recycle()
-        contextBitmap.recycle()
-
-        val output = featherPatch(originalPatch, generatedPatch)
-        originalPatch.recycle()
-        generatedPatch.recycle()
         return output
     }
 
+    /**
+     * Меняет только target-область текущего кадра. На внешней границе alpha=0,
+     * затем smoothstep быстро выходит к 1.0. Padding target-а лежит за буквами
+     * watermark, поэтому сами буквы оказываются в полностью AI-заполненной зоне.
+     */
+    private fun compositeGeneratedRegion(
+        output: Bitmap,
+        generatedContext: Bitmap,
+        target: RectF,
+        contextLeft: Int,
+        contextTop: Int
+    ) {
+        val frameW = output.width
+        val frameH = output.height
+
+        val left = target.left.toInt().coerceIn(0, frameW - 1)
+        val top = target.top.toInt().coerceIn(0, frameH - 1)
+        val right = target.right.toInt().coerceIn(left + 1, frameW)
+        val bottom = target.bottom.toInt().coerceIn(top + 1, frameH)
+        val patchW = right - left
+        val patchH = bottom - top
+
+        val originalPixels = IntArray(patchW * patchH)
+        output.getPixels(
+            originalPixels,
+            0,
+            patchW,
+            left,
+            top,
+            patchW,
+            patchH
+        )
+
+        val generatedPixels = IntArray(patchW * patchH)
+        val maxSourceX = (generatedContext.width - patchW).coerceAtLeast(0)
+        val maxSourceY = (generatedContext.height - patchH).coerceAtLeast(0)
+        val sourceX = (left - contextLeft).coerceIn(0, maxSourceX)
+        val sourceY = (top - contextTop).coerceIn(0, maxSourceY)
+
+        generatedContext.getPixels(
+            generatedPixels,
+            0,
+            patchW,
+            sourceX,
+            sourceY,
+            patchW,
+            patchH
+        )
+
+        // Не делаем огромную полупрозрачную рамку. Достаточно мягких 4–12 px,
+        // так как сама область уже расширена за реальные края watermark.
+        val feather = max(
+            4f,
+            min(12f, min(patchW, patchH) * 0.12f)
+        )
+
+        for (y in 0 until patchH) {
+            for (x in 0 until patchW) {
+                val edgeDistance = minOf(
+                    x.toFloat(),
+                    (patchW - 1 - x).toFloat(),
+                    y.toFloat(),
+                    (patchH - 1 - y).toFloat()
+                )
+                val linear = (edgeDistance / feather).coerceIn(0f, 1f)
+                val alpha = linear * linear * (3f - 2f * linear)
+                val index = y * patchW + x
+                originalPixels[index] = blendRgb(
+                    originalPixels[index],
+                    generatedPixels[index],
+                    alpha
+                )
+            }
+        }
+
+        output.setPixels(
+            originalPixels,
+            0,
+            patchW,
+            left,
+            top,
+            patchW,
+            patchH
+        )
+    }
+
+    /**
+     * Квадратный контекст предотвращает геометрическое растяжение картинки
+     * при приведении к фиксированному входу LaMa 512x512.
+     */
     private fun buildContextRect(mask: RectF, width: Int, height: Int): RectF {
+        val minSide = min(width, height).toFloat().coerceAtLeast(2f)
         val desiredSide = max(
             256f,
-            max(mask.width() * 3.2f, mask.height() * 6.0f)
-        ).coerceAtMost(min(width, height).toFloat())
+            max(mask.width() * 3.5f, mask.height() * 6.5f)
+        ).coerceAtMost(minSide)
 
         var left = mask.centerX() - desiredSide / 2f
         var top = mask.centerY() - desiredSide / 2f
@@ -929,156 +562,172 @@ object NeuralInpainter {
             bottom = height.toFloat()
         }
 
-        left = left.coerceAtLeast(0f)
-        top = top.coerceAtLeast(0f)
-        right = right.coerceAtMost(width.toFloat())
-        bottom = bottom.coerceAtMost(height.toFloat())
+        left = left.coerceIn(0f, (width - 2).toFloat().coerceAtLeast(0f))
+        top = top.coerceIn(0f, (height - 2).toFloat().coerceAtLeast(0f))
+        right = right.coerceIn(left + 2f, width.toFloat())
+        bottom = bottom.coerceIn(top + 2f, height.toFloat())
 
         return RectF(left, top, right, bottom)
     }
 
-    private fun featherPatch(original: Bitmap, generated: Bitmap): Bitmap {
-        val width = original.width
-        val height = original.height
-        val size = width * height
-        val originalPixels = IntArray(size)
-        val generatedPixels = IntArray(size)
-        val outPixels = IntArray(size)
+    /**
+     * OCR/трекер обычно возвращает рамку по видимым буквам. Увеличиваем её,
+     * чтобы полностью удалить полупрозрачное сглаживание и тень watermark.
+     */
+    private fun expandedMask(rect: RectF, width: Int, height: Int): RectF {
+        val safeW = width.coerceAtLeast(3)
+        val safeH = height.coerceAtLeast(3)
+        val padX = max(6f, rect.width() * 0.12f)
+        val padY = max(6f, rect.height() * 0.18f)
 
-        original.getPixels(originalPixels, 0, width, 0, 0, width, height)
-        generated.getPixels(generatedPixels, 0, width, 0, 0, width, height)
+        val left = (rect.left - padX).coerceIn(0f, safeW.toFloat() - 2f)
+        val top = (rect.top - padY).coerceIn(0f, safeH.toFloat() - 2f)
+        val right = (rect.right + padX).coerceIn(left + 2f, safeW.toFloat())
+        val bottom = (rect.bottom + padY).coerceIn(top + 2f, safeH.toFloat())
 
-        val feather = max(3f, min(width, height) * 0.08f)
-        for (y in 0 until height) {
-            for (x in 0 until width) {
-                val edge = minOf(
-                    x.toFloat(),
-                    (width - 1 - x).toFloat(),
-                    y.toFloat(),
-                    (height - 1 - y).toFloat()
-                )
-                val alpha = (edge / feather).coerceIn(0f, 1f)
-                val index = y * width + x
-                outPixels[index] = blend(
-                    originalPixels[index],
-                    generatedPixels[index],
-                    alpha
-                )
-            }
-        }
-
-        return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-            it.setPixels(outPixels, 0, width, 0, 0, width, height)
-        }
+        return RectF(left, top, right, bottom)
     }
 
     /**
-     * g-ronimo/lama_512_int8: [1,4,512,512].
-     * RGB 0..1 с нулями под маской + бинарный mask-канал.
+     * g-ronimo/lama_512_int8:
+     * input = float32 [1,4,512,512].
+     * RGB 0..1, внутри маски RGB=0; четвёртый канал — бинарная mask 0/1.
      */
     private fun combinedInputTensor(
         env: OrtEnvironment,
         bitmap: Bitmap,
-        maskBitmap: Bitmap
+        mask: RectF
     ): OnnxTensor {
-        val size = bitmap.width * bitmap.height
-        val imagePixels = IntArray(size)
-        val maskPixels = IntArray(size)
+        val width = bitmap.width
+        val height = bitmap.height
+        require(width == MODEL_INPUT_SIZE && height == MODEL_INPUT_SIZE) {
+            "LaMa ожидает 512x512, получено ${width}x${height}"
+        }
 
-        bitmap.getPixels(
-            imagePixels,
-            0,
-            bitmap.width,
-            0,
-            0,
-            bitmap.width,
-            bitmap.height
-        )
-        maskBitmap.getPixels(
-            maskPixels,
-            0,
-            maskBitmap.width,
-            0,
-            0,
-            maskBitmap.width,
-            maskBitmap.height
-        )
+        val size = width * height
+        val pixels = IntArray(size)
+        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+        val maskLeft = mask.left.toInt().coerceIn(0, width)
+        val maskTop = mask.top.toInt().coerceIn(0, height)
+        val maskRight = mask.right.roundToInt().coerceIn(maskLeft, width)
+        val maskBottom = mask.bottom.roundToInt().coerceIn(maskTop, height)
+
+        val maskFlags = ByteArray(size)
+        for (y in maskTop until maskBottom) {
+            val row = y * width
+            for (x in maskLeft until maskRight) {
+                maskFlags[row + x] = 1
+            }
+        }
 
         val buffer = FloatBuffer.allocate(4 * size)
 
         for (channel in 0 until 3) {
+            val offset = channel * size
             for (i in 0 until size) {
-                val masked = Color.red(maskPixels[i]) > 127
-                val value = if (masked) {
+                val value = if (maskFlags[i].toInt() != 0) {
                     0f
                 } else {
-                    when (channel) {
-                        0 -> Color.red(imagePixels[i]) / 255f
-                        1 -> Color.green(imagePixels[i]) / 255f
-                        else -> Color.blue(imagePixels[i]) / 255f
+                    val color = when (channel) {
+                        0 -> Color.red(pixels[i])
+                        1 -> Color.green(pixels[i])
+                        else -> Color.blue(pixels[i])
                     }
+                    color / 255f
                 }
-                buffer.put(channel * size + i, value)
+                buffer.put(offset + i, value)
             }
         }
 
         for (i in 0 until size) {
-            buffer.put(
-                3 * size + i,
-                if (Color.red(maskPixels[i]) > 127) 1f else 0f
-            )
+            buffer.put(3 * size + i, if (maskFlags[i].toInt() != 0) 1f else 0f)
         }
 
         buffer.rewind()
         return OnnxTensor.createTensor(
             env,
             buffer,
-            longArrayOf(1, 4, MODEL_INPUT_SIZE.toLong(), MODEL_INPUT_SIZE.toLong())
+            longArrayOf(1, 4, height.toLong(), width.toLong())
         )
     }
 
-    private fun expandedMask(rect: RectF, width: Int, height: Int): RectF {
-        val safeWidth = width.coerceAtLeast(3)
-        val safeHeight = height.coerceAtLeast(3)
-        val padX = maxOf(4f, rect.width() * 0.08f)
-        val padY = maxOf(4f, rect.height() * 0.12f)
+    private fun getSession(context: Context): OrtSession {
+        cachedSession?.let { return it }
 
-        val left = (rect.left - padX).coerceIn(0f, safeWidth.toFloat() - 2f)
-        val top = (rect.top - padY).coerceIn(0f, safeHeight.toFloat() - 2f)
-        val right = (rect.right + padX).coerceIn(left + 2f, safeWidth.toFloat())
-        val bottom = (rect.bottom + padY).coerceIn(top + 2f, safeHeight.toFloat())
+        synchronized(sessionLock) {
+            cachedSession?.let { return it }
 
-        return RectF(left, top, right, bottom)
+            val assetNames = context.assets.list("") ?: emptyArray()
+            if (MODEL_ASSET !in assetNames) {
+                throw IllegalStateException(
+                    "В APK отсутствует $MODEL_ASSET"
+                )
+            }
+
+            val modelBytes = context.assets.open(MODEL_ASSET).use { it.readBytes() }
+            val session = ortEnv.createSession(modelBytes)
+
+            // Защита от незаметной подмены модели/неверного I/O контракта.
+            val inputInfo = session.inputInfo
+            if (!inputInfo.containsKey(INPUT_NAME)) {
+                session.close()
+                throw IllegalStateException(
+                    "У LaMa нет входа '$INPUT_NAME': ${inputInfo.keys.joinToString()}"
+                )
+            }
+
+            cachedSession = session
+            return session
+        }
     }
 
-    private fun blend(a: Int, b: Int, alpha: Float): Int {
-        if (alpha <= 0f) return a
-        if (alpha >= 1f) return b
-
-        val inv = 1f - alpha
-        return Color.rgb(
-            (Color.red(a) * inv + Color.red(b) * alpha).toInt().coerceIn(0, 255),
-            (Color.green(a) * inv + Color.green(b) * alpha).toInt().coerceIn(0, 255),
-            (Color.blue(a) * inv + Color.blue(b) * alpha).toInt().coerceIn(0, 255)
-        )
-    }
-
+    /** Выход модели — RGB float32 0..1, CHW. */
     private fun tensorToBitmap(tensor: OnnxTensor, width: Int, height: Int): Bitmap {
         val buffer = tensor.floatBuffer
         buffer.rewind()
+
+        val expected = 3 * width * height
+        if (buffer.remaining() < expected) {
+            throw IllegalStateException(
+                "Неверный размер выхода LaMa: ${buffer.remaining()}, ожидалось $expected"
+            )
+        }
 
         val size = width * height
         val pixels = IntArray(size)
 
         for (i in 0 until size) {
-            val r = (buffer.get(i) * 255f).toInt().coerceIn(0, 255)
-            val g = (buffer.get(size + i) * 255f).toInt().coerceIn(0, 255)
-            val b = (buffer.get(2 * size + i) * 255f).toInt().coerceIn(0, 255)
+            val r = (buffer.get(i) * 255f).roundToInt().coerceIn(0, 255)
+            val g = (buffer.get(size + i) * 255f).roundToInt().coerceIn(0, 255)
+            val b = (buffer.get(2 * size + i) * 255f).roundToInt().coerceIn(0, 255)
             pixels[i] = Color.rgb(r, g, b)
         }
 
         return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
             it.setPixels(pixels, 0, width, 0, 0, width, height)
         }
+    }
+
+    private fun blendRgb(original: Int, generated: Int, alpha: Float): Int {
+        if (alpha <= 0f) return original
+        if (alpha >= 1f) return Color.rgb(
+            Color.red(generated),
+            Color.green(generated),
+            Color.blue(generated)
+        )
+
+        val inverse = 1f - alpha
+        return Color.rgb(
+            (Color.red(original) * inverse + Color.red(generated) * alpha)
+                .roundToInt()
+                .coerceIn(0, 255),
+            (Color.green(original) * inverse + Color.green(generated) * alpha)
+                .roundToInt()
+                .coerceIn(0, 255),
+            (Color.blue(original) * inverse + Color.blue(generated) * alpha)
+                .roundToInt()
+                .coerceIn(0, 255)
+        )
     }
 }
