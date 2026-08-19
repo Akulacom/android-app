@@ -15,10 +15,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Быстрый режим без размытого delogo-пятна.
+ * Быстрый режим без нейросети.
  *
- * Для каждого короткого временного сегмента подбирается похожий участок фона
- * рядом с watermark. Донор берётся из того же текущего кадра.
+ * Для каждого короткого временного сегмента подбирается похожий чистый участок
+ * фона рядом с watermark. Донор берётся из того же текущего кадра, а его
+ * направление стабилизируется между соседними сегментами, чтобы заплатка не
+ * прыгала и не мерцала.
  */
 object SeamlessCloneProcessor {
 
@@ -33,6 +35,13 @@ object SeamlessCloneProcessor {
         var endMs: Long,
         val dst: RectF,
         val src: RectF
+    )
+
+    private data class SourcePick(
+        val rect: RectF,
+        val score: Double,
+        val offsetX: Int,
+        val offsetY: Int
     )
 
     fun process(
@@ -71,7 +80,7 @@ object SeamlessCloneProcessor {
                     "-map", "0:a?",
                     "-c:v", "libx264",
                     "-preset", "medium",
-                    "-crf", "18",
+                    "-crf", "17",
                     "-pix_fmt", "yuv420p",
                     "-movflags", "+faststart",
                     "-c:a", "copy",
@@ -137,14 +146,17 @@ object SeamlessCloneProcessor {
         if (track.isEmpty()) return emptyList()
 
         val totalMs = durationMs.coerceAtLeast(1L)
-        // Шаг подстраиваем под лимит в 72 сегмента заранее, а не выбрасываем
-        // лишние сегменты потом — иначе между оставшимися сегментами появлялись
-        // дыры, где watermark оставался виден.
-        val stepMs = maxOf(350L, (totalMs + 71L) / 72L)
+
+        // До 96 временных сегментов. Это точнее следует за плавающим watermark,
+        // но остаётся достаточно лёгким для мобильного FFmpeg.
+        val maxSegments = 96L
+        val stepMs = maxOf(250L, (totalMs + maxSegments - 1L) / maxSegments)
         val result = ArrayList<Op>()
 
         var t0 = 0L
         var current: Op? = null
+        var preferredOffset: Pair<Int, Int>? = null
+
         while (t0 < totalMs) {
             val t1 = (t0 + stepMs).coerceAtMost(totalMs)
             val mid = (t0 + t1) / 2L
@@ -157,18 +169,35 @@ object SeamlessCloneProcessor {
                     MediaMetadataRetriever.OPTION_CLOSEST
                 )
 
-                val src = if (frame != null) {
+                val pick = if (frame != null) {
                     try {
-                        chooseBestSource(frame, dst, videoWidth, videoHeight)
+                        chooseBestSource(
+                            bitmap = frame,
+                            dst = dst,
+                            videoWidth = videoWidth,
+                            videoHeight = videoHeight,
+                            preferredOffset = preferredOffset
+                        )
                     } finally {
                         frame.recycle()
                     }
                 } else {
-                    fallbackSource(dst, videoWidth, videoHeight)
+                    val fallback = fallbackSource(dst, videoWidth, videoHeight)
+                    SourcePick(
+                        rect = fallback,
+                        score = Double.MAX_VALUE,
+                        offsetX = (fallback.left - dst.left).toInt(),
+                        offsetY = (fallback.top - dst.top).toInt()
+                    )
                 }
 
-                if (current != null && current.endMs == t0 &&
-                    closeRect(current.dst, dst, 5f) && closeRect(current.src, src, 8f)
+                preferredOffset = pick.offsetX to pick.offsetY
+                val src = pick.rect
+
+                if (current != null &&
+                    current.endMs == t0 &&
+                    closeRect(current.dst, dst, 4f) &&
+                    closeRect(current.src, src, 6f)
                 ) {
                     current.endMs = t1
                 } else {
@@ -177,18 +206,17 @@ object SeamlessCloneProcessor {
                 }
             } else {
                 current = null
+                preferredOffset = null
             }
 
             t0 = t1
         }
 
-        // Шаг уже подобран так, чтобы покрыть весь ролик без дыр,
-        // но страхуемся от выхода за лимит на очень длинных видео:
-        // расширяем окно каждого оставшегося сегмента до начала следующего,
-        // чтобы не было промежутков с видимым watermark.
-        if (result.size <= 72) return result
+        if (result.size <= maxSegments.toInt()) return result
 
-        val stride = kotlin.math.ceil(result.size / 72.0).toInt().coerceAtLeast(1)
+        val stride = kotlin.math.ceil(result.size / maxSegments.toDouble())
+            .toInt()
+            .coerceAtLeast(1)
         val kept = result.filterIndexed { index, _ -> index % stride == 0 }.toMutableList()
         for (i in 0 until kept.size - 1) {
             kept[i].endMs = kept[i + 1].startMs
@@ -197,7 +225,7 @@ object SeamlessCloneProcessor {
         return kept
     }
 
-    /** Bridge only a short inactive hole surrounded by the same-sized track. */
+    /** Закрывает только короткий провал трекера между двумя активными точками. */
     private fun repairState(sorted: List<MaskKeyframe>, timeMs: Long): MaskKeyframe {
         val direct = nearest(sorted, timeMs)
         if (direct.active) return direct
@@ -205,14 +233,14 @@ object SeamlessCloneProcessor {
         val previous = sorted.lastOrNull { it.timeMs <= timeMs && it.active }
         val next = sorted.firstOrNull { it.timeMs >= timeMs && it.active }
         if (previous == null || next == null) return direct
-        if (next.timeMs - previous.timeMs > 1350L) return direct
+        if (next.timeMs - previous.timeMs > 1000L) return direct
 
         val pw = previous.rect.width().coerceAtLeast(1f)
         val ph = previous.rect.height().coerceAtLeast(1f)
         val nw = next.rect.width().coerceAtLeast(1f)
         val nh = next.rect.height().coerceAtLeast(1f)
         val sizeRatio = max(max(pw / nw, nw / pw), max(ph / nh, nh / ph))
-        if (sizeRatio > 2.0f) return direct
+        if (sizeRatio > 1.8f) return direct
 
         val chosen = if (
             kotlin.math.abs(previous.timeMs - timeMs) <=
@@ -246,10 +274,10 @@ object SeamlessCloneProcessor {
     }
 
     private fun sanitizeAndPad(rect: RectF, w: Int, h: Int): RectF {
-        // Запас чуть больше OCR-рамки: закрывает полупрозрачный ореол букв,
-        // чтобы края watermark не просвечивали после наложения заплатки фона.
-        val px = max(5f, rect.width() * 0.09f)
-        val py = max(5f, rect.height() * 0.15f)
+        // Небольшой запас закрывает полупрозрачный ореол букв, но не превращает
+        // узкий watermark в большой прямоугольник восстановления.
+        val px = max(4f, rect.width() * 0.06f)
+        val py = max(4f, rect.height() * 0.10f)
         val l = (rect.left - px).coerceIn(1f, w.toFloat() - 3f)
         val t = (rect.top - py).coerceIn(1f, h.toFloat() - 3f)
         val r = (rect.right + px).coerceIn(l + 2f, w.toFloat() - 1f)
@@ -261,51 +289,87 @@ object SeamlessCloneProcessor {
         bitmap: Bitmap,
         dst: RectF,
         videoWidth: Int,
-        videoHeight: Int
-    ): RectF {
+        videoHeight: Int,
+        preferredOffset: Pair<Int, Int>?
+    ): SourcePick {
         val w = dst.width().toInt().coerceAtLeast(4)
         val h = dst.height().toInt().coerceAtLeast(4)
         val dx = dst.left.toInt()
         val dy = dst.top.toInt()
-        val gap = max(6, min(w, h) / 6)
 
-        val candidates = ArrayList<RectF>()
-        val offsets = listOf(
-            Pair(w + gap, 0), Pair(-(w + gap), 0),
-            Pair(0, h + gap), Pair(0, -(h + gap)),
-            Pair(w + gap, h / 2), Pair(w + gap, -h / 2),
-            Pair(-(w + gap), h / 2), Pair(-(w + gap), -h / 2),
-            Pair(w / 2, h + gap), Pair(-w / 2, h + gap),
-            Pair(w / 2, -(h + gap)), Pair(-w / 2, -(h + gap))
+        val nearGap = max(3, min(w, h) / 10)
+        val farGap = max(7, min(w, h) / 4)
+
+        val offsets = LinkedHashSet<Pair<Int, Int>>()
+
+        if (preferredOffset != null) offsets.add(preferredOffset)
+
+        offsets.addAll(
+            listOf(
+                Pair(w + nearGap, 0), Pair(-(w + nearGap), 0),
+                Pair(0, h + nearGap), Pair(0, -(h + nearGap)),
+                Pair(w + nearGap, h / 2), Pair(w + nearGap, -h / 2),
+                Pair(-(w + nearGap), h / 2), Pair(-(w + nearGap), -h / 2),
+                Pair(w / 2, h + nearGap), Pair(-w / 2, h + nearGap),
+                Pair(w / 2, -(h + nearGap)), Pair(-w / 2, -(h + nearGap)),
+                Pair(w + farGap, 0), Pair(-(w + farGap), 0),
+                Pair(0, h + farGap), Pair(0, -(h + farGap))
+            )
         )
+
+        val candidates = ArrayList<SourcePick>()
 
         for ((ox, oy) in offsets) {
             val x = dx + ox
             val y = dy + oy
-            if (x >= 0 && y >= 0 && x + w <= videoWidth && y + h <= videoHeight) {
-                val c = RectF(x.toFloat(), y.toFloat(), (x + w).toFloat(), (y + h).toFloat())
-                if (!RectF.intersects(c, dst)) candidates.add(c)
+            if (x < 0 || y < 0 || x + w > videoWidth || y + h > videoHeight) continue
+
+            val rect = RectF(
+                x.toFloat(),
+                y.toFloat(),
+                (x + w).toFloat(),
+                (y + h).toFloat()
+            )
+            if (RectF.intersects(rect, dst)) continue
+
+            val score = sourceScore(bitmap, dst, rect)
+            candidates.add(SourcePick(rect, score, ox, oy))
+        }
+
+        if (candidates.isEmpty()) {
+            val fallback = fallbackSource(dst, videoWidth, videoHeight)
+            return SourcePick(
+                rect = fallback,
+                score = Double.MAX_VALUE,
+                offsetX = (fallback.left - dst.left).toInt(),
+                offsetY = (fallback.top - dst.top).toInt()
+            )
+        }
+
+        val best = candidates.minByOrNull { it.score } ?: candidates.first()
+
+        // Гистерезис: если предыдущий относительный донор всё ещё почти такой же
+        // хороший, оставляем его. Это сильно уменьшает мерцание и прыжки заплатки.
+        if (preferredOffset != null) {
+            val preferred = candidates.firstOrNull {
+                it.offsetX == preferredOffset.first && it.offsetY == preferredOffset.second
+            }
+            if (preferred != null && preferred.score <= best.score * 1.12 + 10.0) {
+                return preferred
             }
         }
 
-        if (candidates.isEmpty()) return fallbackSource(dst, videoWidth, videoHeight)
-
-        var best = candidates.first()
-        var bestScore = Double.MAX_VALUE
-        for (candidate in candidates) {
-            val score = borderScore(bitmap, dst, candidate)
-            if (score < bestScore) {
-                bestScore = score
-                best = candidate
-            }
-        }
         return best
+    }
+
+    private fun sourceScore(bitmap: Bitmap, dst: RectF, src: RectF): Double {
+        return borderScore(bitmap, dst, src) + gradientScore(bitmap, dst, src) * 1.6
     }
 
     private fun borderScore(bitmap: Bitmap, dst: RectF, src: RectF): Double {
         val w = min(dst.width().toInt(), src.width().toInt()).coerceAtLeast(2)
         val h = min(dst.height().toInt(), src.height().toInt()).coerceAtLeast(2)
-        val samples = 28
+        val samples = 32
         var total = 0.0
         var count = 0
 
@@ -325,10 +389,7 @@ object SeamlessCloneProcessor {
             count++
         }
 
-        // Destination samples are taken just outside the repair rectangle.
-        // This compares the donor to clean surrounding background, not to the
-        // semi-transparent watermark pixels that we are trying to remove.
-        val outside = 4
+        val outside = 3
         for (i in 0 until samples) {
             val f = i.toFloat() / (samples - 1).toFloat()
 
@@ -346,10 +407,89 @@ object SeamlessCloneProcessor {
         return if (count == 0) Double.MAX_VALUE else total / count.toDouble()
     }
 
+    /**
+     * Сравнивает направление и силу локальных перепадов яркости вокруг рамки.
+     * Это помогает не брать кусок похожего цвета, но с совсем другой текстурой.
+     */
+    private fun gradientScore(bitmap: Bitmap, dst: RectF, src: RectF): Double {
+        val samples = 20
+        var total = 0.0
+        var count = 0
+
+        fun luma(pixel: Int): Double {
+            return Color.red(pixel) * 0.299 +
+                Color.green(pixel) * 0.587 +
+                Color.blue(pixel) * 0.114
+        }
+
+        fun gradientDiff(
+            dx1: Int, dy1: Int, dx2: Int, dy2: Int,
+            sx1: Int, sy1: Int, sx2: Int, sy2: Int
+        ) {
+            val d1 = bitmap.getPixel(
+                dx1.coerceIn(0, bitmap.width - 1),
+                dy1.coerceIn(0, bitmap.height - 1)
+            )
+            val d2 = bitmap.getPixel(
+                dx2.coerceIn(0, bitmap.width - 1),
+                dy2.coerceIn(0, bitmap.height - 1)
+            )
+            val s1 = bitmap.getPixel(
+                sx1.coerceIn(0, bitmap.width - 1),
+                sy1.coerceIn(0, bitmap.height - 1)
+            )
+            val s2 = bitmap.getPixel(
+                sx2.coerceIn(0, bitmap.width - 1),
+                sy2.coerceIn(0, bitmap.height - 1)
+            )
+
+            val gd = luma(d2) - luma(d1)
+            val gs = luma(s2) - luma(s1)
+            total += abs(gd - gs)
+            count++
+        }
+
+        for (i in 0 until samples) {
+            val f = i.toFloat() / (samples - 1).toFloat()
+
+            val dx = dst.left.toInt() + (f * (dst.width() - 1f)).toInt()
+            val sx = src.left.toInt() + (f * (src.width() - 1f)).toInt()
+            gradientDiff(
+                dx, dst.top.toInt() - 4,
+                dx, dst.top.toInt() - 2,
+                sx, src.top.toInt(),
+                sx, src.top.toInt() + 2
+            )
+            gradientDiff(
+                dx, dst.bottom.toInt() + 3,
+                dx, dst.bottom.toInt() + 1,
+                sx, src.bottom.toInt() - 1,
+                sx, src.bottom.toInt() - 3
+            )
+
+            val dy = dst.top.toInt() + (f * (dst.height() - 1f)).toInt()
+            val sy = src.top.toInt() + (f * (src.height() - 1f)).toInt()
+            gradientDiff(
+                dst.left.toInt() - 4, dy,
+                dst.left.toInt() - 2, dy,
+                src.left.toInt(), sy,
+                src.left.toInt() + 2, sy
+            )
+            gradientDiff(
+                dst.right.toInt() + 3, dy,
+                dst.right.toInt() + 1, dy,
+                src.right.toInt() - 1, sy,
+                src.right.toInt() - 3, sy
+            )
+        }
+
+        return if (count == 0) 0.0 else total / count.toDouble()
+    }
+
     private fun fallbackSource(dst: RectF, videoWidth: Int, videoHeight: Int): RectF {
         val w = dst.width().toInt().coerceAtLeast(2)
         val h = dst.height().toInt().coerceAtLeast(2)
-        val gap = max(6, min(w, h) / 6)
+        val gap = max(4, min(w, h) / 10)
 
         val rightX = dst.right.toInt() + gap
         if (rightX + w <= videoWidth) {
@@ -371,15 +511,15 @@ object SeamlessCloneProcessor {
     }
 
     private fun closeRect(a: RectF, b: RectF, tolerance: Float): Boolean {
-        return abs(a.left - b.left) <= tolerance && abs(a.top - b.top) <= tolerance &&
-            abs(a.right - b.right) <= tolerance && abs(a.bottom - b.bottom) <= tolerance
+        return abs(a.left - b.left) <= tolerance &&
+            abs(a.top - b.top) <= tolerance &&
+            abs(a.right - b.right) <= tolerance &&
+            abs(a.bottom - b.bottom) <= tolerance
     }
 
     /**
-     * Clone-fill с мягким пространственным alpha-feather без отдельного
-     * color/alphamerge источника. Alpha строится прямо из donor patch через geq,
-     * поэтому filter_complex остаётся стабильным и края заплатки не выглядят
-     * прямоугольником.
+     * Clone-fill с мягким alpha-feather. Никакого blur к самому видео не
+     * применяется: используется реальная текстура соседнего участка кадра.
      */
     private fun buildFilter(ops: List<Op>): String {
         val sb = StringBuilder()
@@ -394,7 +534,10 @@ object SeamlessCloneProcessor {
             val sy = op.src.top.toInt().coerceAtLeast(0)
             val dx = op.dst.left.toInt().coerceAtLeast(0)
             val dy = op.dst.top.toInt().coerceAtLeast(0)
-            val feather = max(3, min(18, min(w, h) / 5))
+
+            // Более широкий мягкий край уменьшает заметность прямоугольника,
+            // при этом центральная часть остаётся полностью заменённой.
+            val feather = max(4, min(24, min(w, h) / 4))
 
             sb.append("[donor$i]crop=$w:$h:$sx:$sy,format=yuva444p,")
             sb.append("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':")
@@ -409,7 +552,9 @@ object SeamlessCloneProcessor {
             sb.append(";")
         }
 
-        sb.append("[merged]scale=-2:1080[vout]")
+        // Сохраняем исходное разрешение. Раньше принудительный scale=1080
+        // мог дополнительно мылить 720p и зря увеличивать размер файла.
+        sb.append("[merged]format=yuv420p[vout]")
         return sb.toString()
     }
 
