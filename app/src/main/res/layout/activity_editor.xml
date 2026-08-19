@@ -83,7 +83,7 @@
             android:layout_weight="1"
             android:textColor="#FFFFFF"
             android:checked="true"
-            android:text="Быстро (delogo)" />
+            android:text="Обычный (улучшенный)" />
 
         <RadioButton
             android:id="@+id/radioQuality"
